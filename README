@@ -43,6 +43,32 @@ Read the file INSTALL in this directory for more information about how
 to customize and control the build process.  The file NOTES contains
 platform-specific installation and configuration information.
 
+Secure Shell Mode (dl-secure)
+=============================
+
+This distribution includes `sbash', a security-policy-enforcing variant
+of bash.  When invoked as `sbash' (via symlink), it gates execution of
+external commands against a configurable policy file (`/etc/sbash.secure').
+
+Features include:
+
+  * Three enforcement modes: off, audit, and enforce
+  * Path-based allow/deny rules with glob patterns
+  * SHA-256 hash whitelisting of specific binaries
+  * HMAC-SHA256 signature verification for ELF binaries
+    (using `.note.dl-secure' ELF note sections)
+
+A combined `srbash' mode enables both secure and restricted modes
+simultaneously.
+
+To build with secure shell support:
+
+	./configure --enable-secure-shell
+	make
+
+See the file `README-sbash.md' for full documentation on policy format,
+evaluation order, and ELF signature details.
+
 If you are a csh user and wish to convert your csh aliases to Bash
 aliases, you may wish to use the script `examples/misc/alias-conv.sh'
 as a starting point.  The script `examples/misc/cshtobash' is a
