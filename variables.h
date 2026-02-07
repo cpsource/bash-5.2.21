@@ -238,6 +238,7 @@ extern VAR_CONTEXT *global_variables;
 extern VAR_CONTEXT *shell_variables;
 
 extern HASH_TABLE *shell_functions;
+extern HASH_TABLE *shell_function_defs;
 extern HASH_TABLE *temporary_env;
 
 extern int variable_context;
@@ -256,6 +257,8 @@ extern pid_t dollar_dollar_pid;
 extern int localvar_inherit;		/* declared in variables.c */
 
 extern void initialize_shell_variables PARAMS((char **, int));
+extern char *sh_get_home_dir PARAMS((void));
+extern SHELL_VAR *bind_invalid_envvar PARAMS((const char *, char *, int));
 
 extern int validate_inherited_value PARAMS((SHELL_VAR *, int));
 
@@ -377,6 +380,12 @@ extern void set_var_auto_export PARAMS((char *));
 extern void set_func_auto_export PARAMS((const char *));
 
 extern void sort_variables PARAMS((SHELL_VAR **));
+
+/* Promoted from static for cross-module access */
+extern SHELL_VAR *hash_lookup PARAMS((const char *, HASH_TABLE *));
+extern void free_variable_hash_data PARAMS((PTR_T));
+extern SHELL_VAR *bind_variable_internal PARAMS((const char *, char *, HASH_TABLE *, int, int));
+extern void flatten PARAMS((HASH_TABLE *, sh_var_map_func_t *, VARLIST *, int));
 
 extern int chkexport PARAMS((char *));
 extern void maybe_make_export_env PARAMS((void));

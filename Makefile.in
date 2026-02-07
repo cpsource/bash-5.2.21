@@ -444,7 +444,7 @@ LIBRARY_LDFLAGS = $(READLINE_LDFLAGS) $(HISTORY_LDFLAGS) $(GLOB_LDFLAGS) \
 
 # The main source code for the Bourne Again SHell.
 CSOURCES = shell.c eval.c parse.y general.c make_cmd.c print_cmd.c y.tab.c \
-	   dispose_cmd.c execute_cmd.c variables.c $(GLOBC) version.c \
+	   dispose_cmd.c execute_cmd.c variables.c variables_init.c variables_dynamic.c variables_export.c variables_scope.c variables_special.c $(GLOBC) version.c \
 	   expr.c copy_cmd.c flags.c subst.c subst_procsub.c subst_quote.c subst_pattern.c subst_comsub.c subst_extract.c hashcmd.c hashlib.c mailcheck.c \
 	   test.c trap.c alias.c jobs.c nojobs.c $(ALLOC_FILES) braces.c \
 	   input.c bashhist.c array.c arrayfunc.c assoc.c sig.c pathexp.c \
@@ -453,7 +453,7 @@ CSOURCES = shell.c eval.c parse.y general.c make_cmd.c print_cmd.c y.tab.c \
 	   pcomplete.c pcomplib.c syntax.c xmalloc.c
 
 HSOURCES = shell.h flags.h trap.h hashcmd.h hashlib.h jobs.h builtins.h \
-	   general.h variables.h config.h $(ALLOC_HEADERS) alias.h \
+	   general.h variables.h variables_init.h variables_dynamic.h variables_export.h variables_scope.h variables_special.h config.h $(ALLOC_HEADERS) alias.h \
 	   quit.h unwind_prot.h syntax.h ${GRAM_H} \
 	   command.h input.h error.h bashansi.h dispose_cmd.h make_cmd.h \
 	   subst.h externs.h siglist.h bashhist.h bashline.h bashtypes.h \
@@ -489,7 +489,7 @@ ARRAY_O = @ARRAY_O@
 
 # Matching object files.
 OBJECTS	 = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o $(GLOBO) \
-	   dispose_cmd.o execute_cmd.o variables.o copy_cmd.o error.o \
+	   dispose_cmd.o execute_cmd.o variables.o variables_init.o variables_dynamic.o variables_export.o variables_scope.o variables_special.o copy_cmd.o error.o \
 	   expr.o flags.o $(JOBS_O) subst.o subst_procsub.o subst_quote.o subst_pattern.o subst_comsub.o subst_extract.o hashcmd.o hashlib.o mailcheck.o \
 	   trap.o input.o unwind_prot.o pathexp.o sig.o test.o version.o \
 	   alias.o $(ARRAY_O) arrayfunc.o assoc.o braces.o bracecomp.o bashhist.o \

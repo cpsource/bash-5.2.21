@@ -78,6 +78,19 @@ extern int extended_quote;
 extern int singlequote_translations;
 extern void exp_jump_to_top_level PARAMS((int));
 
+/* Macro from subst.c needed for string overrun checking */
+#define CHECK_STRING_OVERRUN(oind, ind, len, ch) \
+  if (ind >= len) \
+    { \
+      oind = len; \
+      ch = 0; \
+      break; \
+    } \
+  else
+
+/* Forward declaration for static functions used before definition */
+static char *extract_delimited_string PARAMS((char *, int *, char *, char *, char *, int));
+
 /* Forward declaration — needed cross-file from subst.c */
 char *extract_dollar_brace_string PARAMS((char *, int *, int, int));
 
