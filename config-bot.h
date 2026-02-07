@@ -107,6 +107,15 @@
 #  define RESTRICTED_SHELL_NAME "rbash"
 #endif
 
+/* If the shell is called by this name, it will enforce security policy. */
+#if defined (SECURE_SHELL)
+#  define SECURE_SHELL_NAME "sbash"
+#  define SECURE_SHELL_CONFIG "/etc/sbash.secure"
+#  if defined (RESTRICTED_SHELL)
+#    define SECURE_RESTRICTED_SHELL_NAME "srbash"
+#  endif
+#endif
+
 /***********************************************************/
 /* Make sure feature defines have necessary prerequisites. */
 /***********************************************************/

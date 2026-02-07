@@ -71,6 +71,10 @@ extern int restricted;
 extern int restricted_shell;
 #endif /* RESTRICTED_SHELL */
 
+#if defined (SECURE_SHELL)
+extern int secure_shell_mode;
+#endif /* SECURE_SHELL */
+
 extern int *find_flag PARAMS((int));
 extern int change_flag PARAMS((int, int));
 extern char *which_set_flags PARAMS((void));

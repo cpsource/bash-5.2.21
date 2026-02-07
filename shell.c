@@ -93,6 +93,10 @@ extern int get_tty_state PARAMS((void));
 #  include <opennt/opennt.h>
 #endif
 
+#if defined (SECURE_SHELL)
+#  include "sbash_secure.h"
+#endif
+
 #if !defined (HAVE_GETPW_DECLS)
 extern struct passwd *getpwuid ();
 #endif /* !HAVE_GETPW_DECLS */
@@ -228,6 +232,10 @@ int dump_po_strings;		/* Dump strings in $"..." in po format */
 #endif
 int wordexp_only = 0;		/* Do word expansion only */
 int protected_mode = 0;		/* No command substitution with --wordexp */
+
+#if defined (SECURE_SHELL)
+int secure_shell_mode = 0;	/* Non-zero means security policy enforcement */
+#endif
 
 int pretty_print_mode = 0;	/* pretty-print a shell script */
 
@@ -681,6 +689,11 @@ main (argc, argv, env)
      is not in restricted mode when running the startup files. */
   saverst = restricted;
   restricted = 0;
+#endif
+
+#if defined (SECURE_SHELL)
+  if (secure_shell_mode)
+    sbash_secure_init ();
 #endif
 
   /* Set positional parameters before running startup files. top_level_arg_index
@@ -1310,6 +1323,54 @@ maybe_make_restricted (name)
 }
 #endif /* RESTRICTED_SHELL */
 
+#if defined (SECURE_SHELL)
+/* Return 1 if the shell should enforce security policy based on NAME or
+   the value of `secure_shell_mode'. */
+int
+shell_is_secure (name)
+     char *name;
+{
+  char *temp;
+
+  if (secure_shell_mode)
+    return 1;
+  temp = base_pathname (name);
+  if (*temp == '-')
+    temp++;
+  if (STREQ (temp, SECURE_SHELL_NAME))
+    return 1;
+#if defined (RESTRICTED_SHELL)
+  if (STREQ (temp, SECURE_RESTRICTED_SHELL_NAME))
+    return 1;
+#endif
+  return 0;
+}
+
+/* Perhaps make this shell a `secure' one, based on NAME.  If the
+   basename of NAME is "sbash", then this shell enforces security policy. */
+int
+maybe_make_secure (name)
+     char *name;
+{
+  char *temp;
+
+  temp = base_pathname (name);
+  if (*temp == '-')
+    temp++;
+  if (secure_shell_mode || STREQ (temp, SECURE_SHELL_NAME)
+#if defined (RESTRICTED_SHELL)
+      || STREQ (temp, SECURE_RESTRICTED_SHELL_NAME)
+#endif
+     )
+    {
+      secure_shell_mode = 1;
+      if (!sbash_secure_active ())
+	sbash_secure_init ();
+    }
+  return (secure_shell_mode);
+}
+#endif /* SECURE_SHELL */
+
 /* Fetch the current set of uids and gids and return 1 if we're running
    setuid or setgid. */
 static int
@@ -1808,6 +1869,18 @@ set_shell_name (argv0)
     act_like_sh++;
   if (shell_name[0] == 's' && shell_name[1] == 'u' && shell_name[2] == '\0')
     su_shell++;
+
+#if defined (SECURE_SHELL)
+  if (STREQ (shell_name, SECURE_SHELL_NAME))
+    secure_shell_mode = 1;
+#  if defined (RESTRICTED_SHELL)
+  if (STREQ (shell_name, SECURE_RESTRICTED_SHELL_NAME))
+    {
+      secure_shell_mode = 1;
+      restricted = 1;
+    }
+#  endif
+#endif
 
   shell_name = argv0 ? argv0 : PROGRAM;
   FREE (dollar_vars[0]);

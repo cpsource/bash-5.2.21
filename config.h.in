@@ -83,6 +83,11 @@
    flag. */
 #undef RESTRICTED_SHELL
 
+/* Define SECURE_SHELL if you want the generated shell to have the
+   ability to enforce a security policy.  The shell thus generated can
+   become a secure shell by being run with the name "sbash". */
+#undef SECURE_SHELL
+
 /* Define DISABLED_BUILTINS if you want "builtin foo" to always run the
    shell builtin "foo", even if it has been disabled with "enable -n foo". */
 #undef DISABLED_BUILTINS

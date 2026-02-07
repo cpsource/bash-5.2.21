@@ -98,6 +98,10 @@ extern int errno;
 #  include "alias.h"
 #endif
 
+#if defined (SECURE_SHELL)
+#  include "sbash_secure.h"
+#endif
+
 #if defined (HISTORY)
 #  include "bashhist.h"
 #endif
@@ -5628,6 +5632,19 @@ execute_disk_command (words, redirects, command_line, pipe_in, pipe_out,
   command = search_for_command (pathname, CMDSRCH_HASH|(stdpath ? CMDSRCH_STDPATH : 0));
   QUIT;
 
+#if defined (SECURE_SHELL)
+  if (secure_shell_mode && command)
+    {
+      if (sbash_secure_check (command) != 0)
+	{
+	  last_command_exit_value = EXECUTION_FAILURE;
+	  internal_error (_("%s: execution denied by security policy"), pathname);
+	  result = last_command_exit_value;
+	  goto parent_return;
+	}
+    }
+#endif /* SECURE_SHELL */
+
   if (command)
     {
       /* If we're optimizing out the fork (implicit `exec'), decrement the
@@ -5952,6 +5969,15 @@ shell_execve (command, args, env)
   int larray, i, fd;
   char sample[HASH_BANG_BUFSIZ];
   int sample_len;
+
+#if defined (SECURE_SHELL)
+  if (secure_shell_mode && sbash_secure_check (command) != 0)
+    {
+      internal_error (_("%s: execution denied by security policy"), command);
+      errno = EACCES;
+      return (EX_NOEXEC);
+    }
+#endif
 
   SETOSTYPE (0);		/* Some systems use for USG/POSIX semantics */
   execve (command, args, env);

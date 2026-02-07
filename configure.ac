@@ -153,6 +153,7 @@ opt_history=yes
 opt_bang_history=yes
 opt_dirstack=yes
 opt_restricted=yes
+opt_secure_shell=yes
 opt_process_subst=yes
 opt_prompt_decoding=yes
 opt_select=yes
@@ -200,7 +201,7 @@ dnl added individually
 if test $opt_minimal_config = yes; then
 	opt_job_control=no opt_alias=no opt_readline=no
 	opt_history=no opt_bang_history=no opt_dirstack=no
-	opt_restricted=no opt_process_subst=no opt_prompt_decoding=no
+	opt_restricted=no opt_secure_shell=no opt_process_subst=no opt_prompt_decoding=no
 	opt_select=no opt_help=no opt_array_variables=no opt_dparen_arith=no
 	opt_brace_expansion=no opt_disabled_builtins=no opt_command_timing=no
 	opt_extended_glob=no opt_cond_command=no opt_arith_for_command=no
@@ -243,6 +244,7 @@ AC_ARG_ENABLE(progcomp, AS_HELP_STRING([--enable-progcomp], [enable programmable
 AC_ARG_ENABLE(prompt-string-decoding, AS_HELP_STRING([--enable-prompt-string-decoding], [turn on escape character decoding in prompts]), opt_prompt_decoding=$enableval)
 AC_ARG_ENABLE(readline, AS_HELP_STRING([--enable-readline], [turn on command line editing]), opt_readline=$enableval)
 AC_ARG_ENABLE(restricted, AS_HELP_STRING([--enable-restricted], [enable a restricted shell]), opt_restricted=$enableval)
+AC_ARG_ENABLE(secure-shell, AS_HELP_STRING([--enable-secure-shell], [enable a security-policy-enforcing shell]), opt_secure_shell=$enableval)
 AC_ARG_ENABLE(select, AS_HELP_STRING([--enable-select], [include select command]), opt_select=$enableval)
 AC_ARG_ENABLE(separate-helpfiles, AS_HELP_STRING([--enable-separate-helpfiles], [use external files for help builtin documentation]), opt_separate_help=$enableval)
 AC_ARG_ENABLE(single-help-strings, AS_HELP_STRING([--enable-single-help-strings], [store help documentation as a single string to ease translation]), opt_single_longdoc_strings=$enableval)
@@ -276,6 +278,9 @@ AC_DEFINE(PUSHD_AND_POPD)
 fi
 if test $opt_restricted = yes; then
 AC_DEFINE(RESTRICTED_SHELL)
+fi
+if test $opt_secure_shell = yes; then
+AC_DEFINE(SECURE_SHELL)
 fi
 if test $opt_process_subst = yes; then
 AC_DEFINE(PROCESS_SUBSTITUTION)

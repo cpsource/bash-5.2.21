@@ -883,6 +883,7 @@ enable_progcomp
 enable_prompt_string_decoding
 enable_readline
 enable_restricted
+enable_secure_shell
 enable_select
 enable_separate_helpfiles
 enable_single_help_strings
@@ -1599,6 +1600,7 @@ Optional Features:
                           turn on escape character decoding in prompts
   --enable-readline       turn on command line editing
   --enable-restricted     enable a restricted shell
+  --enable-secure-shell   enable a security-policy-enforcing shell
   --enable-select         include select command
   --enable-separate-helpfiles
                           use external files for help builtin documentation
@@ -3384,6 +3386,7 @@ opt_history=yes
 opt_bang_history=yes
 opt_dirstack=yes
 opt_restricted=yes
+opt_secure_shell=yes
 opt_process_subst=yes
 opt_prompt_decoding=yes
 opt_select=yes
@@ -3431,7 +3434,7 @@ fi
 if test $opt_minimal_config = yes; then
 	opt_job_control=no opt_alias=no opt_readline=no
 	opt_history=no opt_bang_history=no opt_dirstack=no
-	opt_restricted=no opt_process_subst=no opt_prompt_decoding=no
+	opt_restricted=no opt_secure_shell=no opt_process_subst=no opt_prompt_decoding=no
 	opt_select=no opt_help=no opt_array_variables=no opt_dparen_arith=no
 	opt_brace_expansion=no opt_disabled_builtins=no opt_command_timing=no
 	opt_extended_glob=no opt_cond_command=no opt_arith_for_command=no
@@ -3634,6 +3637,12 @@ then :
   enableval=$enable_restricted; opt_restricted=$enableval
 fi
 
+# Check whether --enable-secure-shell was given.
+if test ${enable_secure_shell+y}
+then :
+  enableval=$enable_secure_shell; opt_secure_shell=$enableval
+fi
+
 # Check whether --enable-select was given.
 if test ${enable_select+y}
 then :
@@ -3713,6 +3722,10 @@ printf "%s\n" "#define PUSHD_AND_POPD 1" >>confdefs.h
 fi
 if test $opt_restricted = yes; then
 printf "%s\n" "#define RESTRICTED_SHELL 1" >>confdefs.h
+
+fi
+if test $opt_secure_shell = yes; then
+printf "%s\n" "#define SECURE_SHELL 1" >>confdefs.h
 
 fi
 if test $opt_process_subst = yes; then
@@ -20443,7 +20456,7 @@ fi
 
 { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $bash_cv_func_strtoimax" >&5
 printf "%s\n" "$bash_cv_func_strtoimax" >&6; }
-if test $bash_cv_func_strtoimax = yes; then
+if test $bash_cv_func_strtoimax = no; then
 case " $LIBOBJS " in
   *" strtoimax.$ac_objext "* ) ;;
   *) LIBOBJS="$LIBOBJS strtoimax.$ac_objext"
