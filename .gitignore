@@ -1,0 +1,6 @@
+build-bash/
+build-static/
+stamps/
+*.o
+*.so
+*.a
