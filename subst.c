@@ -68,6 +68,15 @@
 #include <tilde/tilde.h>
 #include <glob/strmatch.h>
 
+#if defined (PROCESS_SUBSTITUTION)
+#include "subst_procsub.h"
+#endif
+
+#include "subst_quote.h"
+#include "subst_pattern.h"
+#include "subst_comsub.h"
+#include "subst_extract.h"
+
 #if !defined (errno)
 extern int errno;
 #endif /* !errno */
@@ -90,6 +99,11 @@ extern int errno;
 #define ST_CTLESC	0x02
 #define ST_SQUOTE	0x04	/* unused yet */
 #define ST_DQUOTE	0x08	/* unused yet */
+
+/* Values for the quoted_state variable in expand_word_internal. */
+#define UNQUOTED	 0
+#define PARTIALLY_QUOTED 1
+#define WHOLLY_QUOTED    2
 
 /* These defs make it easier to use the editor. */
 #define LBRACE		'{'
@@ -151,17 +165,7 @@ pid_t last_command_subst_pid = NO_PID;
 pid_t current_command_subst_pid = NO_PID;
 
 /* Variables used to keep track of the characters in IFS. */
-SHELL_VAR *ifs_var;
-char *ifs_value;
-unsigned char ifs_cmap[UCHAR_MAX + 1];
-int ifs_is_set, ifs_is_null;
-
-#if defined (HANDLE_MULTIBYTE)
-unsigned char ifs_firstc[MB_LEN_MAX];
-size_t ifs_firstc_len;
-#else
-unsigned char ifs_firstc;
-#endif
+IFS_STATE global_ifs;
 
 /* If non-zero, command substitution inherits the value of errexit option */
 int inherit_errexit = 0;
@@ -176,20 +180,8 @@ int assigning_in_environment;
    SIGCHLD trap and so it can be saved and restored by the trap handlers. */
 WORD_LIST *subst_assign_varlist = (WORD_LIST *)NULL;
 
-/* Tell the expansion functions to not longjmp back to top_level on fatal
-   errors.  Enabled when doing completion and prompt string expansion. */
-int no_longjmp_on_fatal_error = 0;
-
-/* Non-zero means to allow unmatched globbed filenames to expand to
-   a null file. */
-int allow_null_glob_expansion;
-
-/* Non-zero means to throw an error when globbing fails to match anything. */
-int fail_glob_expansion;
-
-/* If non-zero, perform `&' substitution on the replacement string in the
-   pattern substitution word expansion. */
-int patsub_replacement = 1;
+/* Expansion control flags — single instance, macros in subst.h. */
+EXPAND_FLAGS global_expand_flags = { 0, 0, 0, 1, 0 };
 
 /* Extern functions and variables from different files. */
 extern struct fd_bitmap *current_fds_to_close;
@@ -219,41 +211,29 @@ static WORD_LIST *cached_quoted_dollar_at = 0;
 /* Distinguished error values to return from expansion functions */
 static WORD_LIST expand_word_error, expand_word_fatal;
 static WORD_DESC expand_wdesc_error, expand_wdesc_fatal;
-static char expand_param_error, expand_param_fatal, expand_param_unset;
-static char extract_string_error, extract_string_fatal;
-
-/* Set by expand_word_unsplit and several of the expand_string_XXX functions;
-   used to inhibit splitting and re-joining $* on $IFS, primarily when doing
-   assignment statements.  The idea is that if we're in a context where this
-   is set, we're not going to be performing word splitting, so we use the same
-   rules to expand $* as we would if it appeared within double quotes. */
-static int expand_no_split_dollar_star = 0;
+char expand_param_error, expand_param_fatal, expand_param_unset;
+char extract_string_error, extract_string_fatal;
 
 /* A WORD_LIST of words to be expanded by expand_word_list_internal,
    without any leading variable assignments. */
-static WORD_LIST *garglist = (WORD_LIST *)NULL;
+WORD_LIST *garglist = (WORD_LIST *)NULL;
 
 static char *quoted_substring PARAMS((char *, int, int));
-static int quoted_strlen PARAMS((char *));
+static int quoted_strlen PARAMS((const char *));
 static char *quoted_strchr PARAMS((char *, int, int));
 
-static char *expand_string_if_necessary PARAMS((char *, int, EXPFUNC *));
-static inline char *expand_string_to_string_internal PARAMS((char *, int, EXPFUNC *));
 static WORD_LIST *call_expand_word_internal PARAMS((WORD_DESC *, int, int, int *, int *));
 static WORD_LIST *expand_string_internal PARAMS((char *, int));
 static WORD_LIST *expand_string_leave_quoted PARAMS((char *, int));
 static WORD_LIST *expand_string_for_rhs PARAMS((char *, int, int, int, int *, int *));
-static WORD_LIST *expand_string_for_pat PARAMS((char *, int, int *, int *));
 
-static char *quote_escapes_internal PARAMS((const char *, int));
+/* Non-static forward declarations for functions used before their definitions */
+char *expand_string_if_necessary PARAMS((char *, int, EXPFUNC *));
+char *expand_string_to_string_internal PARAMS((char *, int, EXPFUNC *));
+WORD_LIST *expand_string_for_pat PARAMS((char *, int, int *, int *));
+int get_var_and_type PARAMS((char *, char *, array_eltstate_t *, int, int, SHELL_VAR **, char **));
 
-static WORD_LIST *list_quote_escapes PARAMS((WORD_LIST *));
-static WORD_LIST *list_dequote_escapes PARAMS((WORD_LIST *));
-
-static char *make_quoted_char PARAMS((int));
-static WORD_LIST *quote_list PARAMS((WORD_LIST *));
-
-static int unquoted_substring PARAMS((char *, char *));
+static int unquoted_substring PARAMS((const char *, char *));
 static int unquoted_member PARAMS((int, char *));
 
 #if defined (ARRAY_VARS)
@@ -261,41 +241,9 @@ static SHELL_VAR *do_compound_assignment PARAMS((char *, char *, int));
 #endif
 static int do_assignment_internal PARAMS((const WORD_DESC *, int));
 
-static char *string_extract_verbatim PARAMS((char *, size_t, int *, char *, int));
-static char *string_extract PARAMS((char *, int *, char *, int));
-static char *string_extract_double_quoted PARAMS((char *, int *, int));
-static inline char *string_extract_single_quoted PARAMS((char *, int *, int));
-static inline int skip_single_quoted PARAMS((const char *, size_t, int, int));
-static int skip_double_quoted PARAMS((char *, size_t, int, int));
-static char *extract_delimited_string PARAMS((char *, int *, char *, char *, char *, int));
-static char *extract_heredoc_dolbrace_string PARAMS((char *, int *, int, int));
-static char *extract_dollar_brace_string PARAMS((char *, int *, int, int));
-static int skip_matched_pair PARAMS((const char *, int, int, int, int));
 
 static char *pos_params PARAMS((char *, int, int, int, int));
 
-static unsigned char *mb_getcharlens PARAMS((char *, int));
-
-static char *remove_upattern PARAMS((char *, char *, int));
-#if defined (HANDLE_MULTIBYTE) 
-static wchar_t *remove_wpattern PARAMS((wchar_t *, size_t, wchar_t *, int));
-#endif
-static char *remove_pattern PARAMS((char *, char *, int));
-
-static int match_upattern PARAMS((char *, char *, int, char **, char **));
-#if defined (HANDLE_MULTIBYTE)
-static int match_wpattern PARAMS((wchar_t *, char **, size_t, wchar_t *, int, char **, char **));
-#endif
-static int match_pattern PARAMS((char *, char *, int, char **, char **));
-static int getpatspec PARAMS((int, char *));
-static char *getpattern PARAMS((char *, int, int));
-static char *variable_remove_pattern PARAMS((char *, char *, int, int));
-static char *list_remove_pattern PARAMS((WORD_LIST *, char *, int, int, int));
-static char *parameter_list_remove_pattern PARAMS((int, char *, int, int));
-#ifdef ARRAY_VARS
-static char *array_remove_pattern PARAMS((SHELL_VAR *, char *, int, int, int));
-#endif
-static char *parameter_brace_remove_pattern PARAMS((char *, char *, array_eltstate_t *, char *, int, int, int));
 
 static char *string_var_assignment PARAMS((SHELL_VAR *, char *));
 #if defined (ARRAY_VARS)
@@ -311,16 +259,11 @@ static char *array_transform PARAMS((int, SHELL_VAR *, int, int));
 static char *parameter_brace_transform PARAMS((char *, char *, array_eltstate_t *, char *, int, int, int, int));
 static int valid_parameter_transform PARAMS((char *));
 
-static char *process_substitute PARAMS((char *, int));
-
-static char *optimize_cat_file PARAMS((REDIRECT *, int, int, int *));
-static char *read_comsub PARAMS((int, int, int, int *));
-
 #ifdef ARRAY_VARS
 static arrayind_t array_length_reference PARAMS((char *));
 #endif
 
-static int valid_brace_expansion_word PARAMS((char *, int));
+static int valid_brace_expansion_word PARAMS((const char *, int));
 static int chk_atstar PARAMS((char *, int, int, int *, int *));
 static int chk_arithsub PARAMS((const char *, int));
 
@@ -335,16 +278,8 @@ static intmax_t parameter_brace_expand_length PARAMS((char *));
 
 static char *skiparith PARAMS((char *, int));
 static int verify_substring_values PARAMS((SHELL_VAR *, char *, char *, int, intmax_t *, intmax_t *));
-static int get_var_and_type PARAMS((char *, char *, array_eltstate_t *, int, int, SHELL_VAR **, char **));
 static char *mb_substring PARAMS((char *, int, int));
 static char *parameter_brace_substring PARAMS((char *, char *, array_eltstate_t *, char *, int, int, int));
-
-static int shouldexp_replacement PARAMS((char *));
-
-static char *pos_params_pat_subst PARAMS((char *, char *, char *, int));
-
-static char *expand_string_for_patsub PARAMS((char *, int));
-static char *parameter_brace_patsub PARAMS((char *, char *, array_eltstate_t *, char *, int, int, int));
 
 static char *pos_params_casemod PARAMS((char *, char *, int, int));
 static char *parameter_brace_casemod PARAMS((char *, char *, array_eltstate_t *, int, char *, int, int, int));
@@ -356,7 +291,7 @@ static WORD_LIST *expand_word_internal PARAMS((WORD_DESC *, int, int, int *, int
 
 static WORD_LIST *word_list_split PARAMS((WORD_LIST *));
 
-static void exp_jump_to_top_level PARAMS((int));
+void exp_jump_to_top_level PARAMS((int));
 
 static WORD_LIST *separate_out_assignments PARAMS((WORD_LIST *));
 static WORD_LIST *glob_expand_word_list PARAMS((WORD_LIST *, int));
@@ -381,8 +316,7 @@ static int do_assignment_statements PARAMS((WORD_LIST *, char *, int));
 
 #if defined (DEBUG)
 void
-dump_word_flags (flags)
-     int flags;
+dump_word_flags (int flags)
 {
   int f;
 
@@ -546,9 +480,7 @@ dump_word_flags (flags)
 
 #ifdef INCLUDE_UNUSED
 static char *
-quoted_substring (string, start, end)
-     char *string;
-     int start, end;
+quoted_substring (char *string, int start, int end)
 {
   register int len, l;
   register char *result, *s, *r;
@@ -589,10 +521,9 @@ quoted_substring (string, start, end)
 #ifdef INCLUDE_UNUSED
 /* Return the length of S, skipping over quoted characters */
 static int
-quoted_strlen (s)
-     char *s;
+quoted_strlen (const char *s)
 {
-  register char *p;
+  register const char *p;
   int i;
 
   i = 0;
@@ -617,9 +548,7 @@ quoted_strlen (s)
    characters are skipped.  If (FLAGS & ST_CTLESC) is non-zero, characters
    escaped with CTLESC are skipped. */
 static char *
-quoted_strchr (s, c, flags)
-     char *s;
-     int c, flags;
+quoted_strchr (char *s, int c, int flags)
 {
   register char *p;
 
@@ -642,9 +571,7 @@ quoted_strchr (s, c, flags)
 /* Return 1 if CHARACTER appears in an unquoted portion of
    STRING.  Return 0 otherwise.  CHARACTER must be a single-byte character. */
 static int
-unquoted_member (character, string)
-     int character;
-     char *string;
+unquoted_member (int character, char *string)
 {
   size_t slen;
   int sindex, c;
@@ -683,8 +610,7 @@ unquoted_member (character, string)
 
 /* Return 1 if SUBSTR appears in an unquoted portion of STRING. */
 static int
-unquoted_substring (substr, string)
-     char *substr, *string;
+unquoted_substring (const char *substr, char *string)
 {
   size_t slen;
   int sindex, c, sublen;
@@ -738,10 +664,7 @@ unquoted_substring (substr, string)
    case nothing happens.  Gets rid of SOURCE by freeing it.
    Returns TARGET in case the location has changed. */
 INLINE char *
-sub_append_string (source, target, indx, size)
-     char *source, *target;
-     size_t *indx;
-     size_t *size;
+sub_append_string (char *source, char *target, size_t *indx, size_t *size)
 {
   if (source)
     {
@@ -769,11 +692,7 @@ sub_append_string (source, target, indx, size)
 /* Append the textual representation of NUMBER to TARGET.
    INDX and SIZE are as in SUB_APPEND_STRING. */
 char *
-sub_append_number (number, target, indx, size)
-     intmax_t number;
-     char *target;
-     size_t *indx;
-     size_t *size;
+sub_append_number (intmax_t number, char *target, size_t *indx, size_t *size)
 {
   char *temp;
 
@@ -782,2013 +701,6 @@ sub_append_number (number, target, indx, size)
 }
 #endif
 
-/* Extract a substring from STRING, starting at SINDEX and ending with
-   one of the characters in CHARLIST.  Don't make the ending character
-   part of the string.  Leave SINDEX pointing at the ending character.
-   Understand about backslashes in the string.  If (flags & SX_VARNAME)
-   is non-zero, and array variables have been compiled into the shell,
-   everything between a `[' and a corresponding `]' is skipped over.
-   If (flags & SX_NOALLOC) is non-zero, don't return the substring, just
-   update SINDEX.  If (flags & SX_REQMATCH) is non-zero, the string must
-   contain a closing character from CHARLIST. */
-static char *
-string_extract (string, sindex, charlist, flags)
-     char *string;
-     int *sindex;
-     char *charlist;
-     int flags;
-{
-  register int c, i;
-  int found;
-  size_t slen;
-  char *temp;
-  DECLARE_MBSTATE;
-
-  slen = (MB_CUR_MAX > 1) ? strlen (string + *sindex) + *sindex : 0;
-  i = *sindex;
-  found = 0;
-  while (c = string[i])
-    {
-      if (c == '\\')
-	{
-	  if (string[i + 1])
-	    i++;
-	  else
-	    break;
-	}
-#if defined (ARRAY_VARS)
-      else if ((flags & SX_VARNAME) && c == LBRACK)
-	{
-	  int ni;
-	  /* If this is an array subscript, skip over it and continue. */
-	  ni = skipsubscript (string, i, 0);
-	  if (string[ni] == RBRACK)
-	    i = ni;
-	}
-#endif
-      else if (MEMBER (c, charlist))
-	{
-	  found = 1;
-	  break;
-	}
-
-      ADVANCE_CHAR (string, slen, i);
-    }
-
-  /* If we had to have a matching delimiter and didn't find one, return an
-     error and let the caller deal with it. */
-  if ((flags & SX_REQMATCH) && found == 0)
-    {
-      *sindex = i;
-      return (&extract_string_error);
-    }
-  
-  temp = (flags & SX_NOALLOC) ? (char *)NULL : substring (string, *sindex, i);
-  *sindex = i;
-  
-  return (temp);
-}
-
-/* Extract the contents of STRING as if it is enclosed in double quotes.
-   SINDEX, when passed in, is the offset of the character immediately
-   following the opening double quote; on exit, SINDEX is left pointing after
-   the closing double quote.  If STRIPDQ is non-zero, unquoted double
-   quotes are stripped and the string is terminated by a null byte.
-   Backslashes between the embedded double quotes are processed.  If STRIPDQ
-   is zero, an unquoted `"' terminates the string. */
-static char *
-string_extract_double_quoted (string, sindex, flags)
-     char *string;
-     int *sindex, flags;
-{
-  size_t slen;
-  char *send;
-  int j, i, t;
-  unsigned char c;
-  char *temp, *ret;		/* The new string we return. */
-  int pass_next, backquote, si;	/* State variables for the machine. */
-  int dquote;
-  int stripdq;
-  DECLARE_MBSTATE;
-
-  slen = strlen (string + *sindex) + *sindex;
-  send = string + slen;
-
-  stripdq = (flags & SX_STRIPDQ);
-
-  pass_next = backquote = dquote = 0;
-  temp = (char *)xmalloc (1 + slen - *sindex);
-
-  j = 0;
-  i = *sindex;
-  while (c = string[i])
-    {
-      /* Process a character that was quoted by a backslash. */
-      if (pass_next)
-	{
-	  /* XXX - take another look at this in light of Interp 221 */
-	  /* Posix.2 sez:
-
-	     ``The backslash shall retain its special meaning as an escape
-	     character only when followed by one of the characters:
-		$	`	"	\	<newline>''.
-
-	     If STRIPDQ is zero, we handle the double quotes here and let
-	     expand_word_internal handle the rest.  If STRIPDQ is non-zero,
-	     we have already been through one round of backslash stripping,
-	     and want to strip these backslashes only if DQUOTE is non-zero,
-	     indicating that we are inside an embedded double-quoted string. */
-
-	  /* If we are in an embedded quoted string, then don't strip
-	     backslashes before characters for which the backslash
-	     retains its special meaning, but remove backslashes in
-	     front of other characters.  If we are not in an
-	     embedded quoted string, don't strip backslashes at all.
-	     This mess is necessary because the string was already
-	     surrounded by double quotes (and sh has some really weird
-	     quoting rules).
-	     The returned string will be run through expansion as if
-	     it were double-quoted. */
-	  if ((stripdq == 0 && c != '"') ||
-	      (stripdq && ((dquote && (sh_syntaxtab[c] & CBSDQUOTE)) || dquote == 0)))
-	    temp[j++] = '\\';
-	  pass_next = 0;
-
-add_one_character:
-	  COPY_CHAR_I (temp, j, string, send, i);
-	  continue;
-	}
-
-      /* A backslash protects the next character.  The code just above
-	 handles preserving the backslash in front of any character but
-	 a double quote. */
-      if (c == '\\')
-	{
-	  pass_next++;
-	  i++;
-	  continue;
-	}
-
-      /* Inside backquotes, ``the portion of the quoted string from the
-	 initial backquote and the characters up to the next backquote
-	 that is not preceded by a backslash, having escape characters
-	 removed, defines that command''. */
-      if (backquote)
-	{
-	  if (c == '`')
-	    backquote = 0;
-	  temp[j++] = c;	/* COPY_CHAR_I? */
-	  i++;
-	  continue;
-	}
-
-      if (c == '`')
-	{
-	  temp[j++] = c;
-	  backquote++;
-	  i++;
-	  continue;
-	}
-
-      /* Pass everything between `$(' and the matching `)' or a quoted
-	 ${ ... } pair through according to the Posix.2 specification. */
-      if (c == '$' && ((string[i + 1] == LPAREN) || (string[i + 1] == LBRACE)))
-	{
-	  int free_ret = 1;
-
-	  si = i + 2;
-	  if (string[i + 1] == LPAREN)
-	    ret = extract_command_subst (string, &si, (flags & SX_COMPLETE));
-	  else
-	    ret = extract_dollar_brace_string (string, &si, Q_DOUBLE_QUOTES, 0);
-
-	  temp[j++] = '$';
-	  temp[j++] = string[i + 1];
-
-	  /* Just paranoia; ret will not be 0 unless no_longjmp_on_fatal_error
-	     is set. */
-	  if (ret == 0 && no_longjmp_on_fatal_error)
-	    {
-	      free_ret = 0;
-	      ret = string + i + 2;
-	    }
-
-	  /* XXX - CHECK_STRING_OVERRUN here? */
-	  for (t = 0; ret[t]; t++, j++)
-	    temp[j] = ret[t];
-	  temp[j] = string[si];
-
-	  if (si < i + 2)	/* we went back? */
-	    i += 2;
-	  else if (string[si])
-	    {
-	      j++;
-	      i = si + 1;
-	    }
-	  else
-	    i = si;
-
-	  if (free_ret)
-	    free (ret);
-	  continue;
-	}
-
-      /* Add any character but a double quote to the quoted string we're
-	 accumulating. */
-      if (c != '"')
-	goto add_one_character;
-
-      /* c == '"' */
-      if (stripdq)
-	{
-	  dquote ^= 1;
-	  i++;
-	  continue;
-	}
-
-      break;
-    }
-  temp[j] = '\0';
-
-  /* Point to after the closing quote. */
-  if (c)
-    i++;
-  *sindex = i;
-
-  return (temp);
-}
-
-/* This should really be another option to string_extract_double_quoted. */
-static int
-skip_double_quoted (string, slen, sind, flags)
-     char *string;
-     size_t slen;
-     int sind;
-     int flags;
-{
-  int c, i;
-  char *ret;
-  int pass_next, backquote, si;
-  DECLARE_MBSTATE;
-
-  pass_next = backquote = 0;
-  i = sind;
-  while (c = string[i])
-    {
-      if (pass_next)
-	{
-	  pass_next = 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if (c == '\\')
-	{
-	  pass_next++;
-	  i++;
-	  continue;
-	}
-      else if (backquote)
-	{
-	  if (c == '`')
-	    backquote = 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if (c == '`')
-	{
-	  backquote++;
-	  i++;
-	  continue;
-	}
-      else if (c == '$' && ((string[i + 1] == LPAREN) || (string[i + 1] == LBRACE)))
-	{
-	  si = i + 2;
-	  if (string[i + 1] == LPAREN)
-	    ret = extract_command_subst (string, &si, SX_NOALLOC|(flags&SX_COMPLETE));
-	  else
-	    ret = extract_dollar_brace_string (string, &si, Q_DOUBLE_QUOTES, SX_NOALLOC);
-
-	  /* These can consume the entire string if they are unterminated */
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  i = si + 1;
-	  continue;
-	}
-      else if (c != '"')
-	{
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else
-	break;
-    }
-
-  if (c)
-    i++;
-
-  return (i);
-}
-
-/* Extract the contents of STRING as if it is enclosed in single quotes.
-   SINDEX, when passed in, is the offset of the character immediately
-   following the opening single quote; on exit, SINDEX is left pointing after
-   the closing single quote. ALLOWESC allows the single quote to be quoted by
-   a backslash; it's not used yet. */
-static inline char *
-string_extract_single_quoted (string, sindex, allowesc)
-     char *string;
-     int *sindex;
-     int allowesc;
-{
-  register int i;
-  size_t slen;
-  char *t;
-  int pass_next;
-  DECLARE_MBSTATE;
-
-  /* Don't need slen for ADVANCE_CHAR unless multibyte chars possible. */
-  slen = (MB_CUR_MAX > 1) ? strlen (string + *sindex) + *sindex : 0;
-  i = *sindex;
-  pass_next = 0;
-  while (string[i])
-    {
-      if (pass_next)
-	{
-	  pass_next = 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      if (allowesc && string[i] == '\\')
-	pass_next++;
-      else if (string[i] == '\'')
-        break;
-      ADVANCE_CHAR (string, slen, i);
-    }
-
-  t = substring (string, *sindex, i);
-
-  if (string[i])
-    i++;
-  *sindex = i;
-
-  return (t);
-}
-
-/* Skip over a single-quoted string.  We overload the SX_COMPLETE flag to mean
-   that we are splitting out words for completion and have encountered a $'...'
-   string, which allows backslash-escaped single quotes. */
-static inline int
-skip_single_quoted (string, slen, sind, flags)
-     const char *string;
-     size_t slen;
-     int sind;
-     int flags;
-{
-  register int c;
-  DECLARE_MBSTATE;
-
-  c = sind;
-  while (string[c] && string[c] != '\'')
-    {
-      if ((flags & SX_COMPLETE) && string[c] == '\\' && string[c+1] == '\'' && string[c+2])
-	ADVANCE_CHAR (string, slen, c);
-      ADVANCE_CHAR (string, slen, c);
-    }
-
-  if (string[c])
-    c++;
-  return c;
-}
-
-/* Just like string_extract, but doesn't hack backslashes or any of
-   that other stuff.  Obeys CTLESC quoting.  Used to do splitting on $IFS. */
-static char *
-string_extract_verbatim (string, slen, sindex, charlist, flags)
-     char *string;
-     size_t slen;
-     int *sindex;
-     char *charlist;
-     int flags;
-{
-  register int i;
-#if defined (HANDLE_MULTIBYTE)
-  wchar_t *wcharlist;
-#endif
-  int c;
-  char *temp;
-  DECLARE_MBSTATE;
-
-  if ((flags & SX_NOCTLESC) && charlist[0] == '\'' && charlist[1] == '\0')
-    {
-      temp = string_extract_single_quoted (string, sindex, 0);
-      --*sindex;	/* leave *sindex at separator character */
-      return temp;
-    }
-
-  /* This can never be called with charlist == NULL. If *charlist == NULL,
-     we can skip the loop and just return a copy of the string, updating
-     *sindex */
-  if (*charlist == 0)
-    {
-      temp = string + *sindex;
-      c = (*sindex == 0) ? slen : STRLEN (temp);
-      temp = savestring (temp);
-      *sindex += c;
-      return temp;
-    }
-
-  i = *sindex;
-#if defined (HANDLE_MULTIBYTE)
-  wcharlist = 0;
-#endif
-  while (c = string[i])
-    {
-#if defined (HANDLE_MULTIBYTE)
-      size_t mblength;
-#endif
-      if ((flags & SX_NOCTLESC) == 0 && c == CTLESC)
-	{
-	  i += 2;
-	  CHECK_STRING_OVERRUN (i, i, slen, c);
-	  continue;
-	}
-      /* Even if flags contains SX_NOCTLESC, we let CTLESC quoting CTLNUL
-	 through, to protect the CTLNULs from later calls to
-	 remove_quoted_nulls. */
-      else if ((flags & SX_NOESCCTLNUL) == 0 && c == CTLESC && string[i+1] == CTLNUL)
-	{
-	  i += 2;
-	  CHECK_STRING_OVERRUN (i, i, slen, c);
-	  continue;
-	}
-
-#if defined (HANDLE_MULTIBYTE)
-      if (locale_utf8locale && slen > i && UTF8_SINGLEBYTE (string[i]))
-	mblength = (string[i] != 0) ? 1 : 0;
-      else
-	mblength = MBLEN (string + i, slen - i);
-      if (mblength > 1)
-	{
-	  wchar_t wc;
-	  mblength = mbtowc (&wc, string + i, slen - i);
-	  if (MB_INVALIDCH (mblength))
-	    {
-	      if (MEMBER (c, charlist))
-		break;
-	    }
-	  else
-	    {
-	      if (wcharlist == 0)
-		{
-		  size_t len;
-		  len = mbstowcs (wcharlist, charlist, 0);
-		  if (len == -1)
-		    len = 0;
-		  wcharlist = (wchar_t *)xmalloc (sizeof (wchar_t) * (len + 1));
-		  mbstowcs (wcharlist, charlist, len + 1);
-		}
-
-	      if (wcschr (wcharlist, wc))
-		break;
-	    }
-	}
-      else		
-#endif
-      if (MEMBER (c, charlist))
-	break;
-
-      ADVANCE_CHAR (string, slen, i);
-    }
-
-#if defined (HANDLE_MULTIBYTE)
-  FREE (wcharlist);
-#endif
-
-  temp = substring (string, *sindex, i);
-  *sindex = i;
-
-  return (temp);
-}
-
-/* Extract the $( construct in STRING, and return a new string.
-   Start extracting at (SINDEX) as if we had just seen "$(".
-   Make (SINDEX) get the position of the matching ")". )
-   XFLAGS is additional flags to pass to other extraction functions. */
-char *
-extract_command_subst (string, sindex, xflags)
-     char *string;
-     int *sindex;
-     int xflags;
-{
-  char *ret;
-
-  if (string[*sindex] == LPAREN || (xflags & SX_COMPLETE))
-    return (extract_delimited_string (string, sindex, "$(", "(", ")", xflags|SX_COMMAND)); /*)*/
-  else
-    {
-      xflags |= (no_longjmp_on_fatal_error ? SX_NOLONGJMP : 0);
-      ret = xparse_dolparen (string, string+*sindex, sindex, xflags);
-      return ret;
-    }
-}
-
-/* Extract the $[ construct in STRING, and return a new string. (])
-   Start extracting at (SINDEX) as if we had just seen "$[".
-   Make (SINDEX) get the position of the matching "]". */
-char *
-extract_arithmetic_subst (string, sindex)
-     char *string;
-     int *sindex;
-{
-  return (extract_delimited_string (string, sindex, "$[", "[", "]", 0)); /*]*/
-}
-
-#if defined (PROCESS_SUBSTITUTION)
-/* Extract the <( or >( construct in STRING, and return a new string.
-   Start extracting at (SINDEX) as if we had just seen "<(".
-   Make (SINDEX) get the position of the matching ")". */ /*))*/
-char *
-extract_process_subst (string, starter, sindex, xflags)
-     char *string;
-     char *starter;
-     int *sindex;
-     int xflags;
-{
-#if 0
-  /* XXX - check xflags&SX_COMPLETE here? */
-  return (extract_delimited_string (string, sindex, starter, "(", ")", SX_COMMAND));
-#else
-  xflags |= (no_longjmp_on_fatal_error ? SX_NOLONGJMP : 0);
-  return (xparse_dolparen (string, string+*sindex, sindex, xflags));
-#endif
-}
-#endif /* PROCESS_SUBSTITUTION */
-
-#if defined (ARRAY_VARS)
-/* This can be fooled by unquoted right parens in the passed string. If
-   each caller verifies that the last character in STRING is a right paren,
-   we don't even need to call extract_delimited_string. */
-char *
-extract_array_assignment_list (string, sindex)
-     char *string;
-     int *sindex;
-{
-  int slen;
-  char *ret;
-
-  slen = strlen (string);
-  if (string[slen - 1] == RPAREN)
-   {
-      ret = substring (string, *sindex, slen - 1);
-      *sindex = slen - 1;
-      return ret;
-    }
-  return 0;  
-}
-#endif
-
-/* Extract and create a new string from the contents of STRING, a
-   character string delimited with OPENER and CLOSER.  SINDEX is
-   the address of an int describing the current offset in STRING;
-   it should point to just after the first OPENER found.  On exit,
-   SINDEX gets the position of the last character of the matching CLOSER.
-   If OPENER is more than a single character, ALT_OPENER, if non-null,
-   contains a character string that can also match CLOSER and thus
-   needs to be skipped. */
-static char *
-extract_delimited_string (string, sindex, opener, alt_opener, closer, flags)
-     char *string;
-     int *sindex;
-     char *opener, *alt_opener, *closer;
-     int flags;
-{
-  int i, c, si;
-  size_t slen;
-  char *t, *result;
-  int pass_character, nesting_level, in_comment;
-  int len_closer, len_opener, len_alt_opener;
-  DECLARE_MBSTATE;
-
-  slen = strlen (string + *sindex) + *sindex;
-  len_opener = STRLEN (opener);
-  len_alt_opener = STRLEN (alt_opener);
-  len_closer = STRLEN (closer);
-
-  pass_character = in_comment = 0;
-
-  nesting_level = 1;
-  i = *sindex;
-
-  while (nesting_level)
-    {
-      c = string[i];
-
-      /* If a recursive call or a call to ADVANCE_CHAR leaves the index beyond
-	 the end of the string, catch it and cut the loop. */
-      if (i > slen)
-	{
-	  i = slen;
-	  c = string[i = slen];
-	  break;
-	}
-
-      if (c == 0)
-	break;
-
-      if (in_comment)
-	{
-	  if (c == '\n')
-	    in_comment = 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-
-      if (pass_character)	/* previous char was backslash */
-	{
-	  pass_character = 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-
-      /* Not exactly right yet; should handle shell metacharacters and
-	 multibyte characters, too.  See COMMENT_BEGIN define in parse.y */
-      if ((flags & SX_COMMAND) && c == '#' && (i == 0 || string[i - 1] == '\n' || shellblank (string[i - 1])))
-	{
-          in_comment = 1;
-          ADVANCE_CHAR (string, slen, i);
-          continue;
-	}
-        
-      if (c == CTLESC || c == '\\')
-	{
-	  pass_character++;
-	  i++;
-	  continue;
-	}
-
-      /* Process a nested command substitution, but only if we're parsing an
-	 arithmetic substitution. */
-      if ((flags & SX_COMMAND) && string[i] == '$' && string[i+1] == LPAREN)
-        {
-          si = i + 2;
-          t = extract_command_subst (string, &si, flags|SX_NOALLOC);
-          CHECK_STRING_OVERRUN (i, si, slen, c);
-          i = si + 1;
-          continue;
-        }
-
-      /* Process a nested OPENER. */
-      if (STREQN (string + i, opener, len_opener))
-	{
-	  si = i + len_opener;
-	  t = extract_delimited_string (string, &si, opener, alt_opener, closer, flags|SX_NOALLOC);
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-	  i = si + 1;
-	  continue;
-	}
-
-      /* Process a nested ALT_OPENER */
-      if (len_alt_opener && STREQN (string + i, alt_opener, len_alt_opener))
-	{
-	  si = i + len_alt_opener;
-	  t = extract_delimited_string (string, &si, alt_opener, alt_opener, closer, flags|SX_NOALLOC);
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-	  i = si + 1;
-	  continue;
-	}
-
-      /* If the current substring terminates the delimited string, decrement
-	 the nesting level. */
-      if (STREQN (string + i, closer, len_closer))
-	{
-	  i += len_closer - 1;	/* move to last byte of the closer */
-	  nesting_level--;
-	  if (nesting_level == 0)
-	    break;
-	}
-
-      /* Pass old-style command substitution through verbatim. */
-      if (c == '`')
-	{
-	  si = i + 1;
-	  t = string_extract (string, &si, "`", flags|SX_NOALLOC);
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-	  i = si + 1;
-	  continue;
-	}
-
-      /* Pass single-quoted and double-quoted strings through verbatim. */
-      if (c == '\'' || c == '"')
-	{
-	  si = i + 1;
-	  i = (c == '\'') ? skip_single_quoted (string, slen, si, 0)
-			  : skip_double_quoted (string, slen, si, 0);
-	  continue;
-	}
-
-      /* move past this character, which was not special. */
-      ADVANCE_CHAR (string, slen, i);
-    }
-
-  if (c == 0 && nesting_level)
-    {
-      if (no_longjmp_on_fatal_error == 0)
-	{
-	  last_command_exit_value = EXECUTION_FAILURE;
-	  report_error (_("bad substitution: no closing `%s' in %s"), closer, string);
-	  exp_jump_to_top_level (DISCARD);
-	}
-      else
-	{
-	  *sindex = i;
-	  return (char *)NULL;
-	}
-    }
-
-  si = i - *sindex - len_closer + 1;
-  if (flags & SX_NOALLOC)
-    result = (char *)NULL;
-  else    
-    {
-      result = (char *)xmalloc (1 + si);
-      strncpy (result, string + *sindex, si);
-      result[si] = '\0';
-    }
-  *sindex = i;
-
-  return (result);
-}
-
-/* A simplified version of extract_dollar_brace_string that exists to handle
-   $'...' and $"..." quoting in here-documents, since the here-document read
-   path doesn't. It's separate because we don't want to mess with the fast
-   common path. We already know we're going to allocate and return a new
-   string and quoted == Q_HERE_DOCUMENT. We might be able to cut it down
-   some more, but extracting strings and adding them as we go adds complexity.
-   This needs to match the logic in parse.y:parse_matched_pair so we get
-   consistent behavior between here-documents and double-quoted strings. */
-static char *
-extract_heredoc_dolbrace_string (string, sindex, quoted, flags)
-     char *string;
-     int *sindex, quoted, flags;
-{
-  register int i, c;
-  size_t slen, tlen, result_index, result_size;
-  int pass_character, nesting_level, si, dolbrace_state;
-  char *result, *t, *send;
-  DECLARE_MBSTATE;
-
-  pass_character = 0;
-  nesting_level = 1;
-  slen = strlen (string + *sindex) + *sindex;
-  send = string + slen;
-
-  result_size = slen;
-  result_index = 0;
-  result = xmalloc (result_size + 1);
-
-  /* This function isn't called if this condition is not true initially. */
-  dolbrace_state = DOLBRACE_QUOTE;
-
-  i = *sindex;
-  while (c = string[i])
-    {
-      if (pass_character)
-	{
-	  pass_character = 0;
-	  RESIZE_MALLOCED_BUFFER (result, result_index, locale_mb_cur_max + 1, result_size, 64);
-	  COPY_CHAR_I (result, result_index, string, send, i);
-	  continue;
-	}
-
-      /* CTLESCs and backslashes quote the next character. */
-      if (c == CTLESC || c == '\\')
-	{
-	  pass_character++;
-	  RESIZE_MALLOCED_BUFFER (result, result_index, 2, result_size, 64);
-	  result[result_index++] = c;
-	  i++;
-	  continue;
-	}
-
-      /* The entire reason we have this separate function right here. */
-      if (c == '$' && string[i+1] == '\'')
-	{
-	  char *ttrans;
-	  int ttranslen;
-
-	  if ((posixly_correct || extended_quote == 0) && dolbrace_state != DOLBRACE_QUOTE && dolbrace_state != DOLBRACE_QUOTE2)
-	    {
-	      RESIZE_MALLOCED_BUFFER (result, result_index, 3, result_size, 64);
-	      result[result_index++] = '$';
-	      result[result_index++] = '\'';
-	      i += 2;
-	      continue;
-	    }
-
-	  si = i + 2;
-	  t = string_extract_single_quoted (string, &si, 1);	/* XXX */
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  tlen = si - i - 2;	/* -2 since si is one after the close quote */
-	  ttrans = ansiexpand (t, 0, tlen, &ttranslen);
-	  free (t);
-
-	  /* needed to correctly quote any embedded single quotes. */
-	  if (dolbrace_state == DOLBRACE_QUOTE || dolbrace_state == DOLBRACE_QUOTE2)
-	    {
-	      t = sh_single_quote (ttrans);
-	      tlen = strlen (t);
-	      free (ttrans);
-	    }
-	  else if (extended_quote) /* dolbrace_state == DOLBRACE_PARAM */
-	    {
-	      /* This matches what parse.y:parse_matched_pair() does */
-	      t = ttrans;
-	      tlen = strlen (t);
-	    }
-
-	  RESIZE_MALLOCED_BUFFER (result, result_index, tlen + 1, result_size, 64);
-	  strncpy (result + result_index, t, tlen);
-	  result_index += tlen;
-	  free (t);
-	  i = si;
-	  continue;
-	}
-
-#if defined (TRANSLATABLE_STRINGS)
-      if (c == '$' && string[i+1] == '"')
-	{
-	  char *ttrans;
-	  int ttranslen;
-
-	  si = i + 2;
-	  t = string_extract_double_quoted (string, &si, flags);	/* XXX */
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  tlen = si - i - 2;	/* -2 since si is one after the close quote */
-	  ttrans = locale_expand (t, 0, tlen, line_number, &ttranslen);
-	  free (t);
-
-	  t = singlequote_translations ? sh_single_quote (ttrans) : sh_mkdoublequoted (ttrans, ttranslen, 0);
-	  tlen = strlen (t);
-	  free (ttrans);
-
-	  RESIZE_MALLOCED_BUFFER (result, result_index, tlen + 1, result_size, 64);
-	  strncpy (result + result_index, t, tlen);
-	  result_index += tlen;
-	  free (t);
-	  i = si;
-	  continue;
-	}
-#endif /* TRANSLATABLE_STRINGS */
-
-      if (c == '$' && string[i+1] == LBRACE)
-	{
-	  nesting_level++;
-	  RESIZE_MALLOCED_BUFFER (result, result_index, 3, result_size, 64);
-	  result[result_index++] = c;
-	  result[result_index++] = string[i+1];
-	  i += 2;
-	  if (dolbrace_state == DOLBRACE_QUOTE || dolbrace_state == DOLBRACE_QUOTE2 || dolbrace_state == DOLBRACE_WORD)
-	    dolbrace_state = DOLBRACE_PARAM;
-	  continue;
-	}
-
-      if (c == RBRACE)
-	{
-	  nesting_level--;
-	  if (nesting_level == 0)
-	    break;
-	  RESIZE_MALLOCED_BUFFER (result, result_index, 2, result_size, 64);
-	  result[result_index++] = c;
-	  i++;
-	  continue;
-	}
-
-      /* Pass the contents of old-style command substitutions through
-	 verbatim. */
-      if (c == '`')
-	{
-	  si = i + 1;
-	  t = string_extract (string, &si, "`", flags);	/* already know (flags & SX_NOALLOC) == 0) */
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  tlen = si - i - 1;
-	  RESIZE_MALLOCED_BUFFER (result, result_index, tlen + 3, result_size, 64);
-	  result[result_index++] = c;
-	  strncpy (result + result_index, t, tlen);
-	  result_index += tlen;
-	  result[result_index++] = string[si];
-	  free (t);
-	  i = si + 1;
-	  continue;
-	}
-
-      /* Pass the contents of new-style command substitutions and
-	 arithmetic substitutions through verbatim. */
-      if (string[i] == '$' && string[i+1] == LPAREN)
-	{
-	  si = i + 2;
-	  t = extract_command_subst (string, &si, flags);
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  tlen = si - i - 2;
-	  RESIZE_MALLOCED_BUFFER (result, result_index, tlen + 4, result_size, 64);
-	  result[result_index++] = c;
-	  result[result_index++] = LPAREN;
-	  strncpy (result + result_index, t, tlen);
-	  result_index += tlen;
-	  result[result_index++] = string[si];
-	  free (t);
-	  i = si + 1;
-	  continue;
-	}
-
-#if defined (PROCESS_SUBSTITUTION)
-      /* Technically this should only work at the start of a word */
-      if ((string[i] == '<' || string[i] == '>') && string[i+1] == LPAREN)
-	{
-	  si = i + 2;
-	  t = extract_process_subst (string, (string[i] == '<' ? "<(" : ">)"), &si, flags);
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  tlen = si - i - 2;
-	  RESIZE_MALLOCED_BUFFER (result, result_index, tlen + 4, result_size, 64);
-	  result[result_index++] = c;
-	  result[result_index++] = LPAREN;
-	  strncpy (result + result_index, t, tlen);
-	  result_index += tlen;
-	  result[result_index++] = string[si];
-	  free (t);
-	  i = si + 1;
-	  continue;
-	}
-#endif
-
-      if (c == '\'' && posixly_correct && shell_compatibility_level > 42 && dolbrace_state != DOLBRACE_QUOTE)
-	{
-	  COPY_CHAR_I (result, result_index, string, send, i);
-	  continue;
-	}
-
-      /* Pass the contents of single and double-quoted strings through verbatim. */
-      if (c == '"' || c == '\'')
-	{
-	  si = i + 1;
-	  if (c == '"')
-	    t = string_extract_double_quoted (string, &si, flags);
-	  else
-	    t = string_extract_single_quoted (string, &si, 0);
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  tlen = si - i - 2;	/* -2 since si is one after the close quote */
-	  RESIZE_MALLOCED_BUFFER (result, result_index, tlen + 3, result_size, 64);
-	  result[result_index++] = c;
-	  strncpy (result + result_index, t, tlen);
-	  result_index += tlen;
-	  result[result_index++] = string[si - 1];
-	  free (t);
-	  i = si;
-	  continue;
-	}
-
-      /* copy this character, which was not special. */
-      COPY_CHAR_I (result, result_index, string, send, i);
-
-      /* This logic must agree with parse.y:parse_matched_pair, since they
-	 share the same defines. */
-      if (dolbrace_state == DOLBRACE_PARAM && c == '%' && (i - *sindex) > 1)
-	dolbrace_state = DOLBRACE_QUOTE;
-      else if (dolbrace_state == DOLBRACE_PARAM && c == '#' && (i - *sindex) > 1)
-        dolbrace_state = DOLBRACE_QUOTE;
-      else if (dolbrace_state == DOLBRACE_PARAM && c == '/' && (i - *sindex) > 1)
-        dolbrace_state = DOLBRACE_QUOTE2;	/* XXX */
-      else if (dolbrace_state == DOLBRACE_PARAM && c == '^' && (i - *sindex) > 1)
-        dolbrace_state = DOLBRACE_QUOTE;
-      else if (dolbrace_state == DOLBRACE_PARAM && c == ',' && (i - *sindex) > 1)
-        dolbrace_state = DOLBRACE_QUOTE;
-      /* This is intended to handle all of the [:]op expansions and the substring/
-	 length/pattern removal/pattern substitution expansions. */
-      else if (dolbrace_state == DOLBRACE_PARAM && strchr ("#%^,~:-=?+/", c) != 0)
-	dolbrace_state = DOLBRACE_OP;
-      else if (dolbrace_state == DOLBRACE_OP && strchr ("#%^,~:-=?+/", c) == 0)
-	dolbrace_state = DOLBRACE_WORD;
-    }
-
-  if (c == 0 && nesting_level)
-    {
-      free (result);
-      if (no_longjmp_on_fatal_error == 0)
-	{			/* { */
-	  last_command_exit_value = EXECUTION_FAILURE;
-	  report_error (_("bad substitution: no closing `%s' in %s"), "}", string);
-	  exp_jump_to_top_level (DISCARD);
-	}
-      else
-	{
-	  *sindex = i;
-	  return ((char *)NULL);
-	}
-    }
-
-  *sindex = i;
-  result[result_index] = '\0';
-
-  return (result);
-}
-
-#define PARAMEXPNEST_MAX	32	// for now
-static int dbstate[PARAMEXPNEST_MAX];
-
-/* Extract a parameter expansion expression within ${ and } from STRING.
-   Obey the Posix.2 rules for finding the ending `}': count braces while
-   skipping over enclosed quoted strings and command substitutions.
-   SINDEX is the address of an int describing the current offset in STRING;
-   it should point to just after the first `{' found.  On exit, SINDEX
-   gets the position of the matching `}'.  QUOTED is non-zero if this
-   occurs inside double quotes. */
-/* XXX -- this is very similar to extract_delimited_string -- XXX */
-static char *
-extract_dollar_brace_string (string, sindex, quoted, flags)
-     char *string;
-     int *sindex, quoted, flags;
-{
-  register int i, c;
-  size_t slen;
-  int pass_character, nesting_level, si, dolbrace_state;
-  char *result, *t;
-  DECLARE_MBSTATE;
-
-  /* The handling of dolbrace_state needs to agree with the code in parse.y:
-     parse_matched_pair().  The different initial value is to handle the
-     case where this function is called to parse the word in
-     ${param op word} (SX_WORD). */
-  dolbrace_state = (flags & SX_WORD) ? DOLBRACE_WORD : DOLBRACE_PARAM;
-  if ((quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) && (flags & SX_POSIXEXP))
-    dolbrace_state = DOLBRACE_QUOTE;
-
-  if (quoted == Q_HERE_DOCUMENT && dolbrace_state == DOLBRACE_QUOTE && (flags & SX_NOALLOC) == 0)
-    return (extract_heredoc_dolbrace_string (string, sindex, quoted, flags));
-
-  dbstate[0] = dolbrace_state;
-
-  pass_character = 0;
-  nesting_level = 1;
-  slen = strlen (string + *sindex) + *sindex;
-
-  i = *sindex;
-  while (c = string[i])
-    {
-      if (pass_character)
-	{
-	  pass_character = 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-
-      /* CTLESCs and backslashes quote the next character. */
-      if (c == CTLESC || c == '\\')
-	{
-	  pass_character++;
-	  i++;
-	  continue;
-	}
-
-      if (string[i] == '$' && string[i+1] == LBRACE)
-	{
-	  if (nesting_level < PARAMEXPNEST_MAX)
-	    dbstate[nesting_level] = dolbrace_state;
-	  nesting_level++;
-	  i += 2;
-	  if (dolbrace_state == DOLBRACE_QUOTE || dolbrace_state == DOLBRACE_WORD)
-	    dolbrace_state = DOLBRACE_PARAM;
-	  continue;
-	}
-
-      if (c == RBRACE)
-	{
-	  nesting_level--;
-	  if (nesting_level == 0)
-	    break;
-	  dolbrace_state = (nesting_level < PARAMEXPNEST_MAX) ? dbstate[nesting_level] : dbstate[0];	/* Guess using initial state */
-	  i++;
-	  continue;
-	}
-
-      /* Pass the contents of old-style command substitutions through
-	 verbatim. */
-      if (c == '`')
-	{
-	  si = i + 1;
-	  t = string_extract (string, &si, "`", flags|SX_NOALLOC);
-
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  i = si + 1;
-	  continue;
-	}
-
-      /* Pass the contents of new-style command substitutions and
-	 arithmetic substitutions through verbatim. */
-      if (string[i] == '$' && string[i+1] == LPAREN)
-	{
-	  si = i + 2;
-	  t = extract_command_subst (string, &si, flags|SX_NOALLOC);
-
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  i = si + 1;
-	  continue;
-	}
-
-#if defined (PROCESS_SUBSTITUTION)
-      /* Technically this should only work at the start of a word */
-      if ((string[i] == '<' || string[i] == '>') && string[i+1] == LPAREN)
-	{
-	  si = i + 2;
-	  t = extract_process_subst (string, (string[i] == '<' ? "<(" : ">)"), &si, flags|SX_NOALLOC);
-
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  i = si + 1;
-	  continue;
-	}
-#endif
-
-      /* Pass the contents of double-quoted strings through verbatim. */
-      if (c == '"')
-	{
-	  si = i + 1;
-	  i = skip_double_quoted (string, slen, si, 0);
-	  /* skip_XXX_quoted leaves index one past close quote */
-	  continue;
-	}
-
-      if (c == '\'')
-	{
-/*itrace("extract_dollar_brace_string: c == single quote flags = %d quoted = %d dolbrace_state = %d", flags, quoted, dolbrace_state);*/
-	  if (posixly_correct && shell_compatibility_level > 42 && dolbrace_state != DOLBRACE_QUOTE && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
-	    ADVANCE_CHAR (string, slen, i);
-	  else
-	    {
-	      si = i + 1;
-	      i = skip_single_quoted (string, slen, si, 0);
-	    }
-
-          continue;
-	}
-
-#if defined (ARRAY_VARS)
-      if (c == LBRACK && dolbrace_state == DOLBRACE_PARAM)
-	{
-	  si = skipsubscript (string, i, 0);
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-	  if (string[si] == RBRACK)
-	    c = string[i = si];
-	}
-#endif
-
-      /* move past this character, which was not special. */
-      ADVANCE_CHAR (string, slen, i);
-
-      /* This logic must agree with parse.y:parse_matched_pair, since they
-	 share the same defines. */
-      if (dolbrace_state == DOLBRACE_PARAM && c == '%' && (i - *sindex) > 1)
-	dolbrace_state = DOLBRACE_QUOTE;
-      else if (dolbrace_state == DOLBRACE_PARAM && c == '#' && (i - *sindex) > 1)
-        dolbrace_state = DOLBRACE_QUOTE;
-      else if (dolbrace_state == DOLBRACE_PARAM && c == '/' && (i - *sindex) > 1)
-        dolbrace_state = DOLBRACE_QUOTE2;	/* XXX */
-      else if (dolbrace_state == DOLBRACE_PARAM && c == '^' && (i - *sindex) > 1)
-        dolbrace_state = DOLBRACE_QUOTE;
-      else if (dolbrace_state == DOLBRACE_PARAM && c == ',' && (i - *sindex) > 1)
-        dolbrace_state = DOLBRACE_QUOTE;
-      /* This is intended to handle all of the [:]op expansions and the substring/
-	 length/pattern removal/pattern substitution expansions. */
-      else if (dolbrace_state == DOLBRACE_PARAM && strchr ("#%^,~:-=?+/", c) != 0)
-	dolbrace_state = DOLBRACE_OP;
-      else if (dolbrace_state == DOLBRACE_OP && strchr ("#%^,~:-=?+/", c) == 0)
-	dolbrace_state = DOLBRACE_WORD;
-    }
-
-  if (c == 0 && nesting_level)
-    {
-      if (no_longjmp_on_fatal_error == 0)
-	{			/* { */
-	  last_command_exit_value = EXECUTION_FAILURE;
-	  report_error (_("bad substitution: no closing `%s' in %s"), "}", string);
-	  exp_jump_to_top_level (DISCARD);
-	}
-      else
-	{
-	  *sindex = i;
-	  return ((char *)NULL);
-	}
-    }
-
-  result = (flags & SX_NOALLOC) ? (char *)NULL : substring (string, *sindex, i);
-  *sindex = i;
-
-  return (result);
-}
-
-/* Remove backslashes which are quoting backquotes from STRING.  Modifies
-   STRING, and returns a pointer to it. */
-char *
-de_backslash (string)
-     char *string;
-{
-  register size_t slen;
-  register int i, j, prev_i;
-  DECLARE_MBSTATE;
-
-  slen = strlen (string);
-  i = j = 0;
-
-  /* Loop copying string[i] to string[j], i >= j. */
-  while (i < slen)
-    {
-      if (string[i] == '\\' && (string[i + 1] == '`' || string[i + 1] == '\\' ||
-			      string[i + 1] == '$'))
-	i++;
-      prev_i = i;
-      ADVANCE_CHAR (string, slen, i);
-      if (j < prev_i)
-	do string[j++] = string[prev_i++]; while (prev_i < i);
-      else
-	j = i;
-    }
-  string[j] = '\0';
-
-  return (string);
-}
-
-#if 0
-/*UNUSED*/
-/* Replace instances of \! in a string with !. */
-void
-unquote_bang (string)
-     char *string;
-{
-  register int i, j;
-  register char *temp;
-
-  temp = (char *)xmalloc (1 + strlen (string));
-
-  for (i = 0, j = 0; (temp[j] = string[i]); i++, j++)
-    {
-      if (string[i] == '\\' && string[i + 1] == '!')
-	{
-	  temp[j] = '!';
-	  i++;
-	}
-    }
-  strcpy (string, temp);
-  free (temp);
-}
-#endif
-
-#define CQ_RETURN(x) do { no_longjmp_on_fatal_error = oldjmp; return (x); } while (0)
-
-/* When FLAGS & 2 == 0, this function assumes STRING[I] == OPEN; when
-   FLAGS & 2 != 0, it assumes STRING[I] points to one character past OPEN;
-   returns with STRING[RET] == close; used to parse array subscripts.
-   FLAGS & 1 means not to attempt to skip over matched pairs of quotes or
-   backquotes, or skip word expansions; it is intended to be used after
-   expansion has been performed and during final assignment parsing (see
-   arrayfunc.c:assign_compound_array_list()) or during execution by a builtin
-   which has already undergone word expansion. */
-static int
-skip_matched_pair (string, start, open, close, flags)
-     const char *string;
-     int start, open, close, flags;
-{
-  int i, pass_next, backq, si, c, count, oldjmp;
-  size_t slen;
-  char *temp, *ss;
-  DECLARE_MBSTATE;
-
-  slen = strlen (string + start) + start;
-  oldjmp = no_longjmp_on_fatal_error;
-  no_longjmp_on_fatal_error = 1;
-
-  /* Move to the first character after a leading OPEN. If FLAGS&2, we assume
-    that START already points to that character. If not, we need to skip over
-    it here. */
-  i = (flags & 2) ? start : start + 1;
-  count = 1;
-  pass_next = backq = 0;
-  ss = (char *)string;
-  while (c = string[i])
-    {
-      if (pass_next)
-	{
-	  pass_next = 0;
-	  if (c == 0)
-	    CQ_RETURN(i);
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if ((flags & 1) == 0 && c == '\\')
-	{
-	  pass_next = 1;
-	  i++;
-	  continue;
-	}
-      else if (backq)
-	{
-	  if (c == '`')
-	    backq = 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if ((flags & 1) == 0 && c == '`')
-	{
-	  backq = 1;
-	  i++;
-	  continue;
-	}
-      else if ((flags & 1) == 0 && c == open)
-	{
-	  count++;
-	  i++;
-	  continue;
-	}
-      else if (c == close)
-	{
-	  count--;
-	  if (count == 0)
-	    break;
-	  i++;
-	  continue;
-	}
-      else if ((flags & 1) == 0 && (c == '\'' || c == '"'))
-	{
-	  i = (c == '\'') ? skip_single_quoted (ss, slen, ++i, 0)
-			  : skip_double_quoted (ss, slen, ++i, 0);
-	  /* no increment, the skip functions increment past the closing quote. */
-	}
-      else if ((flags & 1) == 0 && c == '$' && (string[i+1] == LPAREN || string[i+1] == LBRACE))
-	{
-	  si = i + 2;
-	  if (string[si] == '\0')
-	    CQ_RETURN(si);
-
-	  /* XXX - extract_command_subst here? */
-	  if (string[i+1] == LPAREN)
-	    temp = extract_delimited_string (ss, &si, "$(", "(", ")", SX_NOALLOC|SX_COMMAND); /* ) */
-	  else
-	    temp = extract_dollar_brace_string (ss, &si, 0, SX_NOALLOC);
-
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-
-	  i = si;
-	  if (string[i] == '\0')	/* don't increment i past EOS in loop */
-	    break;
-	  i++;
-	  continue;
-	}
-      else
-	ADVANCE_CHAR (string, slen, i);
-    }
-
-  CQ_RETURN(i);
-}
-
-#if defined (ARRAY_VARS)
-/* FLAGS has 1 as a reserved value, since skip_matched_pair uses it for
-   skipping over quoted strings and taking the first instance of the
-   closing character. FLAGS & 2 means that STRING[START] points one
-   character past the open bracket; FLAGS & 2 == 0 means that STRING[START]
-   points to the open bracket. skip_matched_pair knows how to deal with this. */
-int
-skipsubscript (string, start, flags)
-     const char *string;
-     int start, flags;
-{
-  return (skip_matched_pair (string, start, '[', ']', flags));
-}
-#endif
-
-/* Skip characters in STRING until we find a character in DELIMS, and return
-   the index of that character.  START is the index into string at which we
-   begin.  This is similar in spirit to strpbrk, but it returns an index into
-   STRING and takes a starting index.  This little piece of code knows quite
-   a lot of shell syntax.  It's very similar to skip_double_quoted and other
-   functions of that ilk. */
-int
-skip_to_delim (string, start, delims, flags)
-     char *string;
-     int start;
-     char *delims;
-     int flags;
-{
-  int i, pass_next, backq, dquote, si, c, oldjmp;
-  int invert, skipquote, skipcmd, noprocsub, completeflag;
-  int arithexp, skipcol;
-  size_t slen;
-  char *temp, open[3];
-  DECLARE_MBSTATE;
-
-  slen = strlen (string + start) + start;
-  oldjmp = no_longjmp_on_fatal_error;
-  if (flags & SD_NOJMP)
-    no_longjmp_on_fatal_error = 1;
-  invert = (flags & SD_INVERT);
-  skipcmd = (flags & SD_NOSKIPCMD) == 0;
-  noprocsub = (flags & SD_NOPROCSUB);
-  completeflag = (flags & SD_COMPLETE) ? SX_COMPLETE : 0;
-
-  arithexp = (flags & SD_ARITHEXP);
-  skipcol = 0;
-
-  i = start;
-  pass_next = backq = dquote = 0;
-  while (c = string[i])
-    {
-      /* If this is non-zero, we should not let quote characters be delimiters
-	 and the current character is a single or double quote.  We should not
-	 test whether or not it's a delimiter until after we skip single- or
-	 double-quoted strings. */
-      skipquote = ((flags & SD_NOQUOTEDELIM) && (c == '\'' || c =='"'));
-      if (pass_next)
-	{
-	  pass_next = 0;
-	  if (c == 0)
-	    CQ_RETURN(i);
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if (c == '\\')
-	{
-	  pass_next = 1;
-	  i++;
-	  continue;
-	}
-      else if (backq)
-	{
-	  if (c == '`')
-	    backq = 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if (c == '`')
-	{
-	  backq = 1;
-	  i++;
-	  continue;
-	}
-      else if (arithexp && skipcol && c == ':')
-	{
-	  skipcol--;
-	  i++;
-	  continue;
-	}
-      else if (arithexp && c == '?')
-	{
-	  skipcol++;
-	  i++;
-	  continue;
-	}
-      else if (skipquote == 0 && invert == 0 && member (c, delims))
-	break;
-      /* the usual case is to use skip_xxx_quoted, but we don't skip over double
-	 quoted strings when looking for the history expansion character as a
-	 delimiter. */
-      /* special case for programmable completion which takes place before
-         parser converts backslash-escaped single quotes between $'...' to
-         `regular' single-quoted strings. */
-      else if (completeflag && i > 0 && string[i-1] == '$' && c == '\'')
-	i = skip_single_quoted (string, slen, ++i, SX_COMPLETE);
-      else if (c == '\'')
-	i = skip_single_quoted (string, slen, ++i, 0);
-      else if (c == '"')
-	i = skip_double_quoted (string, slen, ++i, completeflag);
-      else if (c == LPAREN && arithexp)
-        {
-          si = i + 1;
-          if (string[si] == '\0')
-	    CQ_RETURN(si);
-
-	  temp = extract_delimited_string (string, &si, "(", "(", ")", SX_NOALLOC); /* ) */
-	  i = si;
-	  if (string[i] == '\0')	/* don't increment i past EOS in loop */
-	    break;
-	  i++;
-	  continue;         
-        }
-      else if (c == '$' && ((skipcmd && string[i+1] == LPAREN) || string[i+1] == LBRACE))
-	{
-	  si = i + 2;
-	  if (string[si] == '\0')
-	    CQ_RETURN(si);
-
-	  if (string[i+1] == LPAREN)
-	    temp = extract_delimited_string (string, &si, "$(", "(", ")", SX_NOALLOC|SX_COMMAND|completeflag); /* ) */
-	  else
-	    temp = extract_dollar_brace_string (string, &si, 0, SX_NOALLOC);
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-	  i = si;
-	  if (string[i] == '\0')	/* don't increment i past EOS in loop */
-	    break;
-	  i++;
-	  continue;
-	}
-#if defined (PROCESS_SUBSTITUTION)
-      else if (skipcmd && noprocsub == 0 && (c == '<' || c == '>') && string[i+1] == LPAREN)
-	{
-	  si = i + 2;
-	  if (string[si] == '\0')
-	    CQ_RETURN(si);
-
-	  temp = extract_delimited_string (string, &si, (c == '<') ? "<(" : ">(", "(", ")", SX_COMMAND|SX_NOALLOC); /* )) */
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-	  i = si;
-	  if (string[i] == '\0')
-	    break;
-	  i++;
-	  continue;
-	}
-#endif /* PROCESS_SUBSTITUTION */
-#if defined (EXTENDED_GLOB)
-      else if ((flags & SD_EXTGLOB) && extended_glob && string[i+1] == LPAREN && member (c, "?*+!@"))
-	{
-	  si = i + 2;
-	  if (string[si] == '\0')
-	    CQ_RETURN(si);
-
-	  open[0] = c;
-	  open[1] = LPAREN;
-	  open[2] = '\0';
-	  temp = extract_delimited_string (string, &si, open, "(", ")", SX_NOALLOC); /* ) */
-
-	  CHECK_STRING_OVERRUN (i, si, slen, c);
-	  i = si;
-	  if (string[i] == '\0')	/* don't increment i past EOS in loop */
-	    break;
-	  i++;
-	  continue;
-	}
-#endif
-      else if ((flags & SD_GLOB) && c == LBRACK)
-	{
-	  si = i + 1;
-	  if (string[si] == '\0')
-	    CQ_RETURN(si);
-
-	  temp = extract_delimited_string (string, &si, "[", "[", "]", SX_NOALLOC); /* ] */
-
-	  i = si;
-	  if (string[i] == '\0')	/* don't increment i past EOS in loop */
-	    break;
-	  i++;
-	  continue;
-	}
-      else if ((skipquote || invert) && (member (c, delims) == 0))
-	break;
-      else
-	ADVANCE_CHAR (string, slen, i);
-    }
-
-  CQ_RETURN(i);
-}
-
-#if defined (BANG_HISTORY)
-/* Skip to the history expansion character (delims[0]), paying attention to
-   quoted strings and command and process substitution.  This is a stripped-
-   down version of skip_to_delims.  The essential difference is that this
-   resets the quoting state when starting a command substitution */
-int
-skip_to_histexp (string, start, delims, flags)
-     char *string;
-     int start;
-     char *delims;
-     int flags;
-{
-  int i, pass_next, backq, dquote, c, oldjmp;
-  int histexp_comsub, histexp_backq, old_dquote;
-  size_t slen;
-  DECLARE_MBSTATE;
-
-  slen = strlen (string + start) + start;
-  oldjmp = no_longjmp_on_fatal_error;
-  if (flags & SD_NOJMP)
-    no_longjmp_on_fatal_error = 1;
-
-  histexp_comsub = histexp_backq = old_dquote = 0;
-
-  i = start;
-  pass_next = backq = dquote = 0;
-  while (c = string[i])
-    {
-      if (pass_next)
-	{
-	  pass_next = 0;
-	  if (c == 0)
-	    CQ_RETURN(i);
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if (c == '\\')
-	{
-	  pass_next = 1;
-	  i++;
-	  continue;
-	}
-      else if (backq && c == '`')
-	{
-	  backq = 0;
-	  histexp_backq--;
-	  dquote = old_dquote;
-	  i++;
-	  continue;
-	}
-      else if (c == '`')
-	{
-	  backq = 1;
-	  histexp_backq++;
-	  old_dquote = dquote;		/* simple - one level for now */
-	  dquote = 0;
-	  i++;
-	  continue;
-	}
-      /* When in double quotes, act as if the double quote is a member of
-	 history_no_expand_chars, like the history library does */
-      else if (dquote && c == delims[0] && string[i+1] == '"')
-	{
-	  i++;
-	  continue;
-	}
-      else if (c == delims[0])
-	break;
-      /* the usual case is to use skip_xxx_quoted, but we don't skip over double
-	 quoted strings when looking for the history expansion character as a
-	 delimiter. */
-      else if (dquote && c == '\'')
-        {
-          i++;
-          continue;
-        }
-      else if (c == '\'')
-	i = skip_single_quoted (string, slen, ++i, 0);
-      /* The posixly_correct test makes posix-mode shells allow double quotes
-	 to quote the history expansion character */
-      else if (posixly_correct == 0 && c == '"')
-	{
-	  dquote = 1 - dquote;
-	  i++;
-	  continue;
-	}     
-      else if (c == '"')
-	i = skip_double_quoted (string, slen, ++i, 0);
-#if defined (PROCESS_SUBSTITUTION)
-      else if ((c == '$' || c == '<' || c == '>') && string[i+1] == LPAREN && string[i+2] != LPAREN)
-#else
-      else if (c == '$' && string[i+1] == LPAREN && string[i+2] != LPAREN)
-#endif
-        {
-	  if (string[i+2] == '\0')
-	    CQ_RETURN(i+2);
-	  i += 2;
-	  histexp_comsub++;
-	  old_dquote = dquote;
-	  dquote = 0;
-        }
-      else if (histexp_comsub && c == RPAREN)
-	{
-	  histexp_comsub--;
-	  dquote = old_dquote;
-	  i++;
-	  continue;
-	}
-      else if (backq)		/* placeholder */
-	{
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else
-	ADVANCE_CHAR (string, slen, i);
-    }
-
-  CQ_RETURN(i);
-}
-#endif /* BANG_HISTORY */
-
-#if defined (READLINE)
-/* Return 1 if the portion of STRING ending at EINDEX is quoted (there is
-   an unclosed quoted string), or if the character at EINDEX is quoted
-   by a backslash. NO_LONGJMP_ON_FATAL_ERROR is used to flag that the various
-   single and double-quoted string parsing functions should not return an
-   error if there are unclosed quotes or braces.  The characters that this
-   recognizes need to be the same as the contents of
-   rl_completer_quote_characters. */
-
-int
-char_is_quoted (string, eindex)
-     char *string;
-     int eindex;
-{
-  int i, pass_next, c, oldjmp;
-  size_t slen;
-  DECLARE_MBSTATE;
-
-  slen = strlen (string);
-  oldjmp = no_longjmp_on_fatal_error;
-  no_longjmp_on_fatal_error = 1;
-  i = pass_next = 0;
-
-  /* If we have an open quoted string from a previous line, see if it's
-     closed before string[eindex], so we don't interpret that close quote
-     as starting a new quoted string. */
-  if (current_command_line_count > 0 && dstack.delimiter_depth > 0)
-    {
-      c = dstack.delimiters[dstack.delimiter_depth - 1];
-      if (c == '\'')
-	i = skip_single_quoted (string, slen, 0, 0);
-      else if (c == '"')
-	i = skip_double_quoted (string, slen, 0, SX_COMPLETE);
-      if (i > eindex)
-	CQ_RETURN (1);
-    }
-
-  while (i <= eindex)
-    {
-      c = string[i];
-
-      if (pass_next)
-	{
-	  pass_next = 0;
-	  if (i >= eindex)	/* XXX was if (i >= eindex - 1) */
-	    CQ_RETURN(1);
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if (c == '\\')
-	{
-	  pass_next = 1;
-	  i++;
-	  continue;
-	}
-      else if (c == '$' && string[i+1] == '\'' && string[i+2])
-	{
-	  i += 2;
-	  i = skip_single_quoted (string, slen, i, SX_COMPLETE);
-	  if (i > eindex)
-	    CQ_RETURN (i);
-	}
-      else if (c == '\'' || c == '"')
-	{
-	  i = (c == '\'') ? skip_single_quoted (string, slen, ++i, 0)
-			  : skip_double_quoted (string, slen, ++i, SX_COMPLETE);
-	  if (i > eindex)
-	    CQ_RETURN(1);
-	  /* no increment, the skip_xxx functions go one past end */
-	}
-      else
-	ADVANCE_CHAR (string, slen, i);
-    }
-
-  CQ_RETURN(0);
-}
-
-int
-unclosed_pair (string, eindex, openstr)
-     char *string;
-     int eindex;
-     char *openstr;
-{
-  int i, pass_next, openc, olen;
-  size_t slen;
-  DECLARE_MBSTATE;
-
-  slen = strlen (string);
-  olen = strlen (openstr);
-  i = pass_next = openc = 0;
-  while (i <= eindex)
-    {
-      if (pass_next)
-	{
-	  pass_next = 0;
-	  if (i >= eindex)	/* XXX was if (i >= eindex - 1) */
-	    return 0;
-	  ADVANCE_CHAR (string, slen, i);
-	  continue;
-	}
-      else if (string[i] == '\\')
-	{
-	  pass_next = 1;
-	  i++;
-	  continue;
-	}
-      else if (STREQN (string + i, openstr, olen))
-	{
-	  openc = 1 - openc;
-	  i += olen;
-	}
-      /* XXX - may want to handle $'...' specially here */
-      else if (string[i] == '\'' || string[i] == '"')
-	{
-	  i = (string[i] == '\'') ? skip_single_quoted (string, slen, i, 0)
-				  : skip_double_quoted (string, slen, i, SX_COMPLETE);
-	  if (i > eindex)
-	    return 0;
-	}
-      else
-	ADVANCE_CHAR (string, slen, i);
-    }
-  return (openc);
-}
-
-/* Split STRING (length SLEN) at DELIMS, and return a WORD_LIST with the
-   individual words.  If DELIMS is NULL, the current value of $IFS is used
-   to split the string, and the function follows the shell field splitting
-   rules.  SENTINEL is an index to look for.  NWP, if non-NULL,
-   gets the number of words in the returned list.  CWP, if non-NULL, gets
-   the index of the word containing SENTINEL.  Non-whitespace chars in
-   DELIMS delimit separate fields.  This is used by programmable completion. */
-WORD_LIST *
-split_at_delims (string, slen, delims, sentinel, flags, nwp, cwp)
-     char *string;
-     int slen;
-     const char *delims;
-     int sentinel, flags;
-     int *nwp, *cwp;
-{
-  int ts, te, i, nw, cw, ifs_split, dflags;
-  char *token, *d, *d2;
-  WORD_LIST *ret, *tl;
-
-  if (string == 0 || *string == '\0')
-    {
-      if (nwp)
-	*nwp = 0;
-      if (cwp)
-	*cwp = 0;	
-      return ((WORD_LIST *)NULL);
-    }
-
-  d = (delims == 0) ? ifs_value : (char *)delims;
-  ifs_split = delims == 0;
-
-  /* Make d2 the non-whitespace characters in delims */
-  d2 = 0;
-  if (delims)
-    {
-      size_t slength;
-#if defined (HANDLE_MULTIBYTE)
-      size_t mblength = 1;
-#endif
-      DECLARE_MBSTATE;
-
-      slength = strlen (delims);
-      d2 = (char *)xmalloc (slength + 1);
-      i = ts = 0;
-      while (delims[i])
-	{
-#if defined (HANDLE_MULTIBYTE)
-	  mbstate_t state_bak;
-	  state_bak = state;
-	  mblength = MBRLEN (delims + i, slength, &state);
-	  if (MB_INVALIDCH (mblength))
-	    state = state_bak;
-	  else if (mblength > 1)
-	    {
-	      memcpy (d2 + ts, delims + i, mblength);
-	      ts += mblength;
-	      i += mblength;
-	      slength -= mblength;
-	      continue;
-	    }
-#endif
-	  if (whitespace (delims[i]) == 0)
-	    d2[ts++] = delims[i];
-
-	  i++;
-	  slength--;
-	}
-      d2[ts] = '\0';
-    }
-
-  ret = (WORD_LIST *)NULL;
-
-  /* Remove sequences of whitespace characters at the start of the string, as
-     long as those characters are delimiters. */
-  for (i = 0; member (string[i], d) && spctabnl (string[i]); i++)
-    ;
-  if (string[i] == '\0')
-    {
-      FREE (d2);
-      return (ret);
-    }
-
-  ts = i;
-  nw = 0;
-  cw = -1;
-  dflags = flags|SD_NOJMP;
-  while (1)
-    {
-      te = skip_to_delim (string, ts, d, dflags);
-
-      /* If we have a non-whitespace delimiter character, use it to make a
-	 separate field.  This is just about what $IFS splitting does and
-	 is closer to the behavior of the shell parser. */
-      if (ts == te && d2 && member (string[ts], d2))
-	{
-	  te = ts + 1;
-	  /* If we're using IFS splitting, the non-whitespace delimiter char
-	     and any additional IFS whitespace delimits a field. */
-	  if (ifs_split)
-	    while (member (string[te], d) && spctabnl (string[te]) && ((flags&SD_NOQUOTEDELIM) == 0 || (string[te] != '\'' && string[te] != '"')))
-	      te++;
-	  else
-	    while (member (string[te], d2) && ((flags&SD_NOQUOTEDELIM) == 0 || (string[te] != '\'' && string[te] != '"')))
-	      te++;
-	}
-
-      token = substring (string, ts, te);
-
-      ret = add_string_to_list (token, ret);	/* XXX */
-      free (token);
-      nw++;
-
-      if (sentinel >= ts && sentinel <= te)
-	cw = nw;
-
-      /* If the cursor is at whitespace just before word start, set the
-	 sentinel word to the current word. */
-      if (cwp && cw == -1 && sentinel == ts-1)
-	cw = nw;
-
-      /* If the cursor is at whitespace between two words, make a new, empty
-	 word, add it before (well, after, since the list is in reverse order)
-	 the word we just added, and set the current word to that one. */
-      if (cwp && cw == -1 && sentinel < ts)
-	{
-	  tl = make_word_list (make_word (""), ret->next);
-	  ret->next = tl;
-	  cw = nw;
-	  nw++;
-	}
-
-      if (string[te] == 0)
-	break;
-
-      i = te;
-      /* XXX - honor SD_NOQUOTEDELIM here */
-      while (member (string[i], d) && (ifs_split || spctabnl(string[i])) && ((flags&SD_NOQUOTEDELIM) == 0 || (string[te] != '\'' && string[te] != '"')))
-	i++;
-
-      if (string[i])
-	ts = i;
-      else
-	break;
-    }
-
-  /* Special case for SENTINEL at the end of STRING.  If we haven't found
-     the word containing SENTINEL yet, and the index we're looking for is at
-     the end of STRING (or past the end of the previously-found token,
-     possible if the end of the line is composed solely of IFS whitespace)
-     add an additional null argument and set the current word pointer to that. */
-  if (cwp && cw == -1 && (sentinel >= slen || sentinel >= te))
-    {
-      if (whitespace (string[sentinel - 1]))
-	{
-	  token = "";
-	  ret = add_string_to_list (token, ret);
-	  nw++;
-	}
-      cw = nw;
-    }
-
-  if (nwp)
-    *nwp = nw;
-  if (cwp)
-    *cwp = cw;
-
-  FREE (d2);
-
-  return (REVERSE_LIST (ret, WORD_LIST *));
-}
-#endif /* READLINE */
-
-#if 0
-/* UNUSED */
-/* Extract the name of the variable to bind to from the assignment string. */
-char *
-assignment_name (string)
-     char *string;
-{
-  int offset;
-  char *temp;
-
-  offset = assignment (string, 0);
-  if (offset == 0)
-    return (char *)NULL;
-  temp = substring (string, 0, offset);
-  return (temp);
-}
-#endif
 
 /* **************************************************************** */
 /*								    */
@@ -2799,9 +711,7 @@ assignment_name (string)
 /* Return a single string of all the words in LIST.  SEP is the separator
    to put between individual elements of LIST in the output string. */
 char *
-string_list_internal (list, sep)
-     WORD_LIST *list;
-     char *sep;
+string_list_internal (WORD_LIST *list, char *sep)
 {
   register WORD_LIST *t;
   char *result, *r;
@@ -2852,8 +762,7 @@ string_list_internal (list, sep)
 /* Return a single string of all the words present in LIST, separating
    each word with a space. */
 char *
-string_list (list)
-     WORD_LIST *list;
+string_list (WORD_LIST *list)
 {
   return (string_list_internal (list, " "));
 }
@@ -2863,8 +772,7 @@ string_list (list)
    the multibyte complications.  If LENP is non-null, it is set to the
    length of the returned string. */
 char *
-ifs_firstchar (lenp)
-     int *lenp;
+ifs_firstchar (int *lenp)
 {
   char *ret;
   int len;
@@ -2902,9 +810,7 @@ ifs_firstchar (lenp)
 /* Posix interpretation 888 changes this when IFS is null by specifying
    that when unquoted, this expands to separate arguments */
 char *
-string_list_dollar_star (list, quoted, flags)
-     WORD_LIST *list;
-     int quoted, flags;
+string_list_dollar_star (WORD_LIST *list, int quoted, int flags)
 {
   char *ret;
 #if defined (HANDLE_MULTIBYTE)
@@ -2959,10 +865,7 @@ string_list_dollar_star (list, quoted, flags)
    one that we didn't handle before is assignment statement arguments to
    declaration builtins like `declare'. */
 char *
-string_list_dollar_at (list, quoted, flags)
-     WORD_LIST *list;
-     int quoted;
-     int flags;
+string_list_dollar_at (WORD_LIST *list, int quoted, int flags)
 {
   char *ifs, *ret;
 #if defined (HANDLE_MULTIBYTE)
@@ -3035,10 +938,7 @@ string_list_dollar_at (list, quoted, flags)
 /* This needs to fully understand the additional contexts where word
    splitting does not occur (W_ASSIGNRHS, etc.) */
 char *
-string_list_pos_params (pchar, list, quoted, pflags)
-     int pchar;
-     WORD_LIST *list;
-     int quoted, pflags;
+string_list_pos_params (int pchar, WORD_LIST *list, int quoted, int pflags)
 {
   char *ret;
   WORD_LIST *tlist;
@@ -3127,9 +1027,7 @@ string_list_pos_params (pchar, list, quoted, pflags)
 							     : ifs_whitespace (c))
 
 WORD_LIST *
-list_string (string, separators, quoted)
-     register char *string, *separators;
-     int quoted;
+list_string (register char *string, register char *separators, int quoted)
 {
   WORD_LIST *result;
   WORD_DESC *t;
@@ -3280,8 +1178,7 @@ list_string (string, separators, quoted)
 #define islocalsep(c)	(local_cmap[(unsigned char)(c)] != 0)
 
 char *
-get_word_from_string (stringp, separators, endptr)
-     char **stringp, *separators, **endptr;
+get_word_from_string (char **stringp, char *separators, char **endptr)
 {
   register char *s;
   char *current_word;
@@ -3379,9 +1276,7 @@ get_word_from_string (stringp, separators, endptr)
    Only let CTLESC escape a white space character if SAW_ESCAPE is
    non-zero.  */
 char *
-strip_trailing_ifs_whitespace (string, separators, saw_escape)
-     char *string, *separators;
-     int saw_escape;
+strip_trailing_ifs_whitespace (char *string, char *separators, int saw_escape)
 {
   char *s;
 
@@ -3398,8 +1293,7 @@ strip_trailing_ifs_whitespace (string, separators, saw_escape)
 /* Split STRING into words at whitespace.  Obeys shell-style quoting with
    backslashes, single and double quotes. */
 WORD_LIST *
-list_string_with_quotes (string)
-     char *string;
+list_string_with_quotes (char *string)
 {
   WORD_LIST *list;
   char *token, *s;
@@ -3456,9 +1350,7 @@ list_string_with_quotes (string)
 
 #if defined (ARRAY_VARS)
 static SHELL_VAR *
-do_compound_assignment (name, value, flags)
-     char *name, *value;
-     int flags;
+do_compound_assignment (char *name, char *value, int flags)
 {
   SHELL_VAR *v;
   int mklocal, mkassoc, mkglobal, chklocal;
@@ -3542,9 +1434,7 @@ do_compound_assignment (name, value, flags)
    expansion on the right-hand side.  Perform tilde expansion in any
    case.  Do not perform word splitting on the result of expansion. */
 static int
-do_assignment_internal (word, expand)
-     const WORD_DESC *word;
-     int expand;
+do_assignment_internal (const WORD_DESC *word, int expand)
 {
   int offset, appendop, assign_list, aflags, retval;
   char *name, *value, *temp;
@@ -3663,8 +1553,7 @@ do_assignment_internal (word, expand)
 /* Perform the assignment statement in STRING, and expand the
    right side by doing tilde, command and parameter expansion. */
 int
-do_assignment (string)
-     char *string;
+do_assignment (char *string)
 {
   WORD_DESC td;
 
@@ -3675,9 +1564,7 @@ do_assignment (string)
 }
 
 int
-do_word_assignment (word, flags)
-     WORD_DESC *word;
-     int flags;
+do_word_assignment (WORD_DESC *word, int flags)
 {
   return do_assignment_internal (word, 1);
 }
@@ -3686,8 +1573,7 @@ do_word_assignment (word, flags)
    of the `=', and bind it to the left side.  Do not perform any word
    expansions on the right hand side. */
 int
-do_assignment_no_expand (string)
-     char *string;
+do_assignment_no_expand (char *string)
 {
   WORD_DESC td;
 
@@ -3722,8 +1608,7 @@ list_rest_of_args ()
 
 /* Return the value of a positional parameter.  This handles values > 10. */
 char *
-get_dollar_var_value (ind)
-     intmax_t ind;
+get_dollar_var_value (intmax_t ind)
 {
   char *temp;
   WORD_LIST *p;
@@ -3744,8 +1629,7 @@ get_dollar_var_value (ind)
    and the rest_of_args.  If DOLLAR_STAR is 1, then obey the special
    case of "$*" with respect to IFS. */
 char *
-string_rest_of_args (dollar_star)
-     int dollar_star;
+string_rest_of_args (int dollar_star)
 {
   register WORD_LIST *list;
   char *string;
@@ -3762,9 +1646,7 @@ string_rest_of_args (dollar_star)
    Q_HERE_DOCUMENT or Q_DOUBLE_QUOTES, this returns a quoted list, otherwise
    no quoting chars are added. */
 static char *
-pos_params (string, start, end, quoted, pflags)
-     char *string;
-     int start, end, quoted, pflags;
+pos_params (char *string, int start, int end, int quoted, int pflags)
 {
   WORD_LIST *save, *params, *h, *t;
   char *ret;
@@ -3826,11 +1708,8 @@ pos_params (string, start, end, quoted, pflags)
 /* If there are any characters in STRING that require full expansion,
    then call FUNC to expand STRING; otherwise just perform quote
    removal if necessary.  This returns a new string. */
-static char *
-expand_string_if_necessary (string, quoted, func)
-     char *string;
-     int quoted;
-     EXPFUNC *func;
+char *
+expand_string_if_necessary (char *string, int quoted, EXPFUNC *func)
 {
   WORD_LIST *list;
   size_t slen;
@@ -3869,11 +1748,8 @@ expand_string_if_necessary (string, quoted, func)
   return ret;
 }
 
-static inline char *
-expand_string_to_string_internal (string, quoted, func)
-     char *string;
-     int quoted;
-     EXPFUNC *func;
+char *
+expand_string_to_string_internal (char *string, int quoted, EXPFUNC *func)
 {
   WORD_LIST *list;
   char *ret;
@@ -3894,25 +1770,19 @@ expand_string_to_string_internal (string, quoted, func)
 }
 
 char *
-expand_string_to_string (string, quoted)
-     char *string;
-     int quoted;
+expand_string_to_string (char *string, int quoted)
 {
   return (expand_string_to_string_internal (string, quoted, expand_string));
 }
 
 char *
-expand_string_unsplit_to_string (string, quoted)
-     char *string;
-     int quoted;
+expand_string_unsplit_to_string (char *string, int quoted)
 {
   return (expand_string_to_string_internal (string, quoted, expand_string_unsplit));
 }
 
 char *
-expand_assignment_string_to_string (string, quoted)
-     char *string;
-     int quoted;
+expand_assignment_string_to_string (char *string, int quoted)
 {
   return (expand_string_to_string_internal (string, quoted, expand_string_assignment));
 }
@@ -3922,9 +1792,7 @@ expand_assignment_string_to_string (string, quoted)
    or a backslash into a backslash. The output of this function must eventually
    be processed by strcreplace(). */
 static char *
-quote_string_for_repl (string, flags)
-     char *string;
-     int flags;
+quote_string_for_repl (char *string, int flags)
 {
   size_t slen;
   char *result, *t;
@@ -3982,10 +1850,8 @@ quote_string_for_repl (string, flags)
    it treats $* as if it were quoted. It dequotes the WORD_LIST, adds
    backslash escapes before CTLESC-quoted backslash and `& if 
    patsub_replacement is enabled. */
-static char *
-expand_string_for_patsub (string, quoted)
-     char *string;
-     int quoted;
+char *
+expand_string_for_patsub (char *string, int quoted)
 {
   WORD_LIST *value;
   char *ret, *t;
@@ -4016,9 +1882,7 @@ expand_string_for_patsub (string, quoted)
 }
 
 char *
-expand_arith_string (string, quoted)
-     char *string;
-     int quoted;
+expand_arith_string (char *string, int quoted)
 {
   WORD_DESC td;
   WORD_LIST *list, *tlist;
@@ -4083,8 +1947,7 @@ expand_arith_string (string, quoted)
 #if defined (COND_COMMAND)
 /* Just remove backslashes in STRING.  Returns a new string. */
 char *
-remove_backslashes (string)
-     char *string;
+remove_backslashes (char *string)
 {
   char *r, *ret, *s;
 
@@ -4114,9 +1977,7 @@ remove_backslashes (string)
    any case, since we don't perform word splitting, we need to do quoted
    null character removal. */
 char *
-cond_expand_word (w, special)
-     WORD_DESC *w;
-     int special;
+cond_expand_word (WORD_DESC *w, int special)
 {
   char *r, *p;
   WORD_LIST *l;
@@ -4172,9 +2033,7 @@ cond_expand_word (w, special)
    FLAGS argument is 1 if this function should treat CTLESC as a quote
    character (e.g., for here-documents) or not (e.g., for shell_expand_line). */
 char *
-expand_string_dollar_quote (string, flags)
-     char *string;
-     int flags;
+expand_string_dollar_quote (char *string, int flags)
 {
   size_t slen, retind, retsize;
   int sindex, c, translen, peekc, news;
@@ -4316,9 +2175,7 @@ expand_string_dollar_quote (string, flags)
    A convenience function for functions that don't want to handle
    any errors or free any memory before aborting. */
 static WORD_LIST *
-call_expand_word_internal (w, q, i, c, e)
-     WORD_DESC *w;
-     int q, i, *c, *e;
+call_expand_word_internal (WORD_DESC *w, int q, int i, int *c, int *e)
 {
   WORD_LIST *result;
 
@@ -4344,9 +2201,7 @@ call_expand_word_internal (w, q, i, c, e)
    Since this does not perform word splitting, it leaves quoted nulls
    in the result.  */
 static WORD_LIST *
-expand_string_internal (string, quoted)
-     char *string;
-     int quoted;
+expand_string_internal (char *string, int quoted)
 {
   WORD_DESC td;
   WORD_LIST *tresult;
@@ -4369,9 +2224,7 @@ expand_string_internal (string, quoted)
    remove_quoted_nulls () is in here because word splitting normally
    takes care of quote removal. */
 WORD_LIST *
-expand_string_unsplit (string, quoted)
-     char *string;
-     int quoted;
+expand_string_unsplit (char *string, int quoted)
 {
   WORD_LIST *value;
 
@@ -4396,9 +2249,7 @@ expand_string_unsplit (string, quoted)
 
 /* Expand the rhs of an assignment statement */
 WORD_LIST *
-expand_string_assignment (string, quoted)
-     char *string;
-     int quoted;
+expand_string_assignment (char *string, int quoted)
 {
   WORD_DESC td;
   WORD_LIST *value;
@@ -4442,10 +2293,7 @@ expand_string_assignment (string, quoted)
    passed string when an error occurs.  Might want to trap other calls
    to jump_to_top_level here so we don't endlessly loop. */
 WORD_LIST *
-expand_prompt_string (string, quoted, wflags)
-     char *string;
-     int quoted;
-     int wflags;
+expand_prompt_string (char *string, int quoted, int wflags)
 {
   WORD_LIST *value;
   WORD_DESC td;
@@ -4484,9 +2332,7 @@ expand_prompt_string (string, quoted, wflags)
    things like ${1+"$@"}.  This does parameter expansion, command
    substitution, arithmetic expansion, and word splitting. */
 static WORD_LIST *
-expand_string_leave_quoted (string, quoted)
-     char *string;
-     int quoted;
+expand_string_leave_quoted (char *string, int quoted)
 {
   WORD_LIST *tlist;
   WORD_LIST *tresult;
@@ -4508,10 +2354,7 @@ expand_string_leave_quoted (string, quoted)
 /* This does not perform word splitting or dequote the WORD_LIST
    it returns. */
 static WORD_LIST *
-expand_string_for_rhs (string, quoted, op, pflags, dollar_at_p, expanded_p)
-     char *string;
-     int quoted, op, pflags;
-     int *dollar_at_p, *expanded_p;
+expand_string_for_rhs (char *string, int quoted, int op, int pflags, int *dollar_at_p, int *expanded_p)
 {
   WORD_DESC td;
   WORD_LIST *tresult;
@@ -4555,10 +2398,8 @@ expand_string_for_rhs (string, quoted, op, pflags, dollar_at_p, expanded_p)
 
 /* This does not perform word splitting or dequote the WORD_LIST
    it returns and it treats $* as if it were quoted. */
-static WORD_LIST *
-expand_string_for_pat (string, quoted, dollar_at_p, expanded_p)
-     char *string;
-     int quoted, *dollar_at_p, *expanded_p;
+WORD_LIST *
+expand_string_for_pat (char *string, int quoted, int *dollar_at_p, int *expanded_p)
 {
   WORD_DESC td;
   WORD_LIST *tresult;
@@ -4584,9 +2425,7 @@ expand_string_for_pat (string, quoted, dollar_at_p, expanded_p)
    does parameter expansion, command substitution, arithmetic expansion,
    and word splitting.  Dequote the resultant WORD_LIST before returning. */
 WORD_LIST *
-expand_string (string, quoted)
-     char *string;
-     int quoted;
+expand_string (char *string, int quoted)
 {
   WORD_LIST *result;
 
@@ -4608,9 +2447,7 @@ expand_string (string, quoted)
    word splitting, and quote removal. */
 
 WORD_LIST *
-expand_word (word, quoted)
-     WORD_DESC *word;
-     int quoted;
+expand_word (WORD_DESC *word, int quoted)
 {
   WORD_LIST *result, *tresult;
 
@@ -4624,9 +2461,7 @@ expand_word (word, quoted)
    does parameter expansion, command substitution, arithmetic expansion,
    and quote removal. */
 WORD_LIST *
-expand_word_unsplit (word, quoted)
-     WORD_DESC *word;
-     int quoted;
+expand_word_unsplit (WORD_DESC *word, int quoted)
 {
   WORD_LIST *result;
 
@@ -4638,9 +2473,7 @@ expand_word_unsplit (word, quoted)
    quote removal on the result.  Virtually identical to expand_word_unsplit;
    could be combined if implementations don't diverge. */
 WORD_LIST *
-expand_word_leave_quoted (word, quoted)
-     WORD_DESC *word;
-     int quoted;
+expand_word_leave_quoted (WORD_DESC *word, int quoted)
 {
   WORD_LIST *result;
 
@@ -4654,2569 +2487,11 @@ expand_word_leave_quoted (word, quoted)
   return result;
 }
 
-/***************************************************
- *						   *
- *	Functions to handle quoting chars	   *
- *						   *
- ***************************************************/
-
-/* Conventions:
-
-     A string with s[0] == CTLNUL && s[1] == 0 is a quoted null string.
-     The parser passes CTLNUL as CTLESC CTLNUL. */
-
-/* Quote escape characters in string s, but no other characters.  This is
-   used to protect CTLESC and CTLNUL in variable values from the rest of
-   the word expansion process after the variable is expanded (word splitting
-   and filename generation).  If IFS is null, we quote spaces as well, just
-   in case we split on spaces later (in the case of unquoted $@, we will
-   eventually attempt to split the entire word on spaces).  Corresponding
-   code exists in dequote_escapes.  Even if we don't end up splitting on
-   spaces, quoting spaces is not a problem.  This should never be called on
-   a string that is quoted with single or double quotes or part of a here
-   document (effectively double-quoted).
-   FLAGS says whether or not we are going to split the result. If we are not,
-   and there is a CTLESC or CTLNUL in IFS, we need to quote CTLESC and CTLNUL,
-   respectively, to prevent them from being removed as part of dequoting. */
-static char *
-quote_escapes_internal (string, flags)
-     const char *string;
-     int flags;
-{
-  const char *s, *send;
-  char *t, *result;
-  size_t slen;
-  int quote_spaces, skip_ctlesc, skip_ctlnul, nosplit;
-  DECLARE_MBSTATE; 
-
-  slen = strlen (string);
-  send = string + slen;
-
-  quote_spaces = (ifs_value && *ifs_value == 0);
-  nosplit = (flags & PF_NOSPLIT2);
-
-  for (skip_ctlesc = skip_ctlnul = 0, s = ifs_value; s && *s; s++)
-    {
-      skip_ctlesc |= (nosplit == 0 && *s == CTLESC);
-      skip_ctlnul |= (nosplit == 0 && *s == CTLNUL);
-    }
-
-  t = result = (char *)xmalloc ((slen * 2) + 1);
-  s = string;
-
-  while (*s)
-    {
-      if ((skip_ctlesc == 0 && *s == CTLESC) || (skip_ctlnul == 0 && *s == CTLNUL) || (quote_spaces && *s == ' '))
-	*t++ = CTLESC;
-      COPY_CHAR_P (t, s, send);
-    }
-  *t = '\0';
-
-  return (result);
-}
-
-char *
-quote_escapes (string)
-     const char *string;
-{
-  return (quote_escapes_internal (string, 0));
-}
-
-char *
-quote_rhs (string)
-     const char *string;
-{
-  return (quote_escapes_internal (string, PF_NOSPLIT2));
-}
-
-static WORD_LIST *
-list_quote_escapes (list)
-     WORD_LIST *list;
-{
-  register WORD_LIST *w;
-  char *t;
-
-  for (w = list; w; w = w->next)
-    {
-      t = w->word->word;
-      w->word->word = quote_escapes (t);
-      free (t);
-    }
-  return list;
-}
-
-/* Inverse of quote_escapes; remove CTLESC protecting CTLESC or CTLNUL.
-
-   The parser passes us CTLESC as CTLESC CTLESC and CTLNUL as CTLESC CTLNUL.
-   This is necessary to make unquoted CTLESC and CTLNUL characters in the
-   data stream pass through properly.
-
-   We need to remove doubled CTLESC characters inside quoted strings before
-   quoting the entire string, so we do not double the number of CTLESC
-   characters.
-
-   Also used by parts of the pattern substitution code. */
-char *
-dequote_escapes (string)
-     const char *string;
-{
-  const char *s, *send;
-  char *t, *result;
-  size_t slen;
-  int quote_spaces;
-  DECLARE_MBSTATE;
-
-  if (string == 0)
-    return (char *)0;
-
-  slen = strlen (string);
-  send = string + slen;
-
-  t = result = (char *)xmalloc (slen + 1);
-
-  if (strchr (string, CTLESC) == 0)
-    return (strcpy (result, string));
-
-  quote_spaces = (ifs_value && *ifs_value == 0);
-
-  s = string;
-  while (*s)
-    {
-      if (*s == CTLESC && (s[1] == CTLESC || s[1] == CTLNUL || (quote_spaces && s[1] == ' ')))
-	{
-	  s++;
-	  if (*s == '\0')
-	    break;
-	}
-      COPY_CHAR_P (t, s, send);
-    }
-  *t = '\0';
-
-  return result;
-}
-
-#if defined (INCLUDE_UNUSED)
-static WORD_LIST *
-list_dequote_escapes (list)
-     WORD_LIST *list;
-{
-  register WORD_LIST *w;
-  char *t;
-
-  for (w = list; w; w = w->next)
-    {
-      t = w->word->word;
-      w->word->word = dequote_escapes (t);
-      free (t);
-    }
-  return list;
-}
-#endif
-
-/* Return a new string with the quoted representation of character C.
-   This turns "" into QUOTED_NULL, so the W_HASQUOTEDNULL flag needs to be
-   set in any resultant WORD_DESC where this value is the word. */
-static char *
-make_quoted_char (c)
-     int c;
-{
-  char *temp;
-
-  temp = (char *)xmalloc (3);
-  if (c == 0)
-    {
-      temp[0] = CTLNUL;
-      temp[1] = '\0';
-    }
-  else
-    {
-      temp[0] = CTLESC;
-      temp[1] = c;
-      temp[2] = '\0';
-    }
-  return (temp);
-}
-
-/* Quote STRING, returning a new string.  This turns "" into QUOTED_NULL, so
-   the W_HASQUOTEDNULL flag needs to be set in any resultant WORD_DESC where
-   this value is the word. */
-char *
-quote_string (string)
-     char *string;
-{
-  register char *t;
-  size_t slen;
-  char *result, *send;
-
-  if (*string == 0)
-    {
-      result = (char *)xmalloc (2);
-      result[0] = CTLNUL;
-      result[1] = '\0';
-    }
-  else
-    {
-      DECLARE_MBSTATE;
-
-      slen = strlen (string);
-      send = string + slen;
-
-      result = (char *)xmalloc ((slen * 2) + 1);
-
-      for (t = result; string < send; )
-	{
-	  *t++ = CTLESC;
-	  COPY_CHAR_P (t, string, send);
-	}
-      *t = '\0';
-    }
-  return (result);
-}
-
-/* De-quote quoted characters in STRING. */
-char *
-dequote_string (string)
-     char *string;
-{
-  register char *s, *t;
-  size_t slen;
-  char *result, *send;
-  DECLARE_MBSTATE;
-
-  if (string[0] == CTLESC && string[1] == 0)
-    internal_debug ("dequote_string: string with bare CTLESC");
-
-  slen = STRLEN (string);
-
-  t = result = (char *)xmalloc (slen + 1);
-
-  if (QUOTED_NULL (string))
-    {
-      result[0] = '\0';
-      return (result);
-    }
-
-  /* A string consisting of only a single CTLESC should pass through unchanged */
-  if (string[0] == CTLESC && string[1] == 0)
-    {
-      result[0] = CTLESC;
-      result[1] = '\0';
-      return (result);
-    }
-
-  /* If no character in the string can be quoted, don't bother examining
-     each character.  Just return a copy of the string passed to us. */
-  if (strchr (string, CTLESC) == NULL)
-    return (strcpy (result, string));
-
-  send = string + slen;
-  s = string;
-  while (*s)
-    {
-      if (*s == CTLESC)
-	{
-	  s++;
-	  if (*s == '\0')
-	    break;
-	}
-      COPY_CHAR_P (t, s, send);
-    }
-
-  *t = '\0';
-  return (result);
-}
-
-/* Quote the entire WORD_LIST list. */
-static WORD_LIST *
-quote_list (list)
-     WORD_LIST *list;
-{
-  register WORD_LIST *w;
-  char *t;
-
-  for (w = list; w; w = w->next)
-    {
-      t = w->word->word;
-      w->word->word = quote_string (t);
-      if (*t == 0)
-	w->word->flags |= W_HASQUOTEDNULL;	/* XXX - turn on W_HASQUOTEDNULL here? */
-      w->word->flags |= W_QUOTED;
-      free (t);
-    }
-  return list;
-}
-
-WORD_DESC *
-dequote_word (word)
-     WORD_DESC *word;
-{
-  register char *s;
-
-  s = dequote_string (word->word);
-  if (QUOTED_NULL (word->word))
-    word->flags &= ~W_HASQUOTEDNULL;
-  free (word->word);
-  word->word = s;
-
-  return word;
-}
-
-/* De-quote quoted characters in each word in LIST. */
-WORD_LIST *
-dequote_list (list)
-     WORD_LIST *list;
-{
-  register char *s;
-  register WORD_LIST *tlist;
-
-  for (tlist = list; tlist; tlist = tlist->next)
-    {
-      s = dequote_string (tlist->word->word);
-      if (QUOTED_NULL (tlist->word->word))
-	tlist->word->flags &= ~W_HASQUOTEDNULL;
-      free (tlist->word->word);
-      tlist->word->word = s;
-    }
-  return list;
-}
-
-/* Remove CTLESC protecting a CTLESC or CTLNUL in place.  Return the passed
-   string. */
-char *
-remove_quoted_escapes (string)
-     char *string;
-{
-  char *t;
-
-  if (string)
-    {
-      t = dequote_escapes (string);
-      strcpy (string, t);
-      free (t);
-    }
-
-  return (string);
-}
-
-/* Remove quoted $IFS characters from STRING.  Quoted IFS characters are
-   added to protect them from word splitting, but we need to remove them
-   if no word splitting takes place.  This returns newly-allocated memory,
-   so callers can use it to replace savestring(). */
-char *
-remove_quoted_ifs (string)
-     char *string;
-{
-  register size_t slen;
-  register int i, j;
-  char *ret, *send;
-  DECLARE_MBSTATE;
-
-  slen = strlen (string);
-  send = string + slen;
-
-  i = j = 0;
-  ret = (char *)xmalloc (slen + 1);
-
-  while (i < slen)
-    {
-      if (string[i] == CTLESC)
-	{
-	  i++;
-	  if (string[i] == 0 || isifs (string[i]) == 0)
-	    ret[j++] = CTLESC;
-	  if (i == slen)
-	    break;
-	}
-
-      COPY_CHAR_I (ret, j, string, send, i);
-    }
-  ret[j] = '\0';
-
-  return (ret);
-}
-
-char *
-remove_quoted_nulls (string)
-     char *string;
-{
-  register size_t slen;
-  register int i, j, prev_i;
-  DECLARE_MBSTATE;
-
-  if (strchr (string, CTLNUL) == 0)		/* XXX */
-    return string;				/* XXX */
-
-  slen = strlen (string);
-  i = j = 0;
-
-  while (i < slen)
-    {
-      if (string[i] == CTLESC)
-	{
-	  /* Old code had j++, but we cannot assume that i == j at this
-	     point -- what if a CTLNUL has already been removed from the
-	     string?  We don't want to drop the CTLESC or recopy characters
-	     that we've already copied down. */
-	  i++;
-	  string[j++] = CTLESC;
-	  if (i == slen)
-	    break;
-	}
-      else if (string[i] == CTLNUL)
-	{
-	  i++;
-	  continue;
-	}
-
-      prev_i = i;
-      ADVANCE_CHAR (string, slen, i);		/* COPY_CHAR_I? */
-      if (j < prev_i)
-	{
-	  do string[j++] = string[prev_i++]; while (prev_i < i);
-	}
-      else
-	j = i;
-    }
-  string[j] = '\0';
-
-  return (string);
-}
-
-/* Perform quoted null character removal on each element of LIST.
-   This modifies LIST. */
-void
-word_list_remove_quoted_nulls (list)
-     WORD_LIST *list;
-{
-  register WORD_LIST *t;
-
-  for (t = list; t; t = t->next)
-    {
-      remove_quoted_nulls (t->word->word);
-      t->word->flags &= ~W_HASQUOTEDNULL;
-    }
-}
-
-/* **************************************************************** */
-/*								    */
-/*	   Functions for Matching and Removing Patterns		    */
-/*								    */
-/* **************************************************************** */
-
-#if defined (HANDLE_MULTIBYTE)
-# ifdef INCLUDE_UNUSED
-static unsigned char *
-mb_getcharlens (string, len)
-     char *string;
-     int len;
-{
-  int i, offset, last;
-  unsigned char *ret;
-  char *p;
-  DECLARE_MBSTATE;
-
-  i = offset = 0;
-  last = 0;
-  ret = (unsigned char *)xmalloc (len);
-  memset (ret, 0, len);
-  while (string[last])
-    {
-      ADVANCE_CHAR (string, len, offset);
-      ret[last] = offset - last;
-      last = offset;
-    }
-  return ret;
-}
-#  endif
-#endif
-
-/* Remove the portion of PARAM matched by PATTERN according to OP, where OP
-   can have one of 4 values:
-	RP_LONG_LEFT	remove longest matching portion at start of PARAM
-	RP_SHORT_LEFT	remove shortest matching portion at start of PARAM
-	RP_LONG_RIGHT	remove longest matching portion at end of PARAM
-	RP_SHORT_RIGHT	remove shortest matching portion at end of PARAM
-*/
-
-#define RP_LONG_LEFT	1
-#define RP_SHORT_LEFT	2
-#define RP_LONG_RIGHT	3
-#define RP_SHORT_RIGHT	4
-
-/* Returns its first argument if nothing matched; new memory otherwise */
-static char *
-remove_upattern (param, pattern, op)
-     char *param, *pattern;
-     int op;
-{
-  register size_t len;
-  register char *end;
-  register char *p, *ret, c;
-
-  len = STRLEN (param);
-  end = param + len;
-
-  switch (op)
-    {
-      case RP_LONG_LEFT:	/* remove longest match at start */
-	for (p = end; p >= param; p--)
-	  {
-	    c = *p; *p = '\0';
-	    if (strmatch (pattern, param, FNMATCH_EXTFLAG) != FNM_NOMATCH)
-	      {
-		*p = c;
-		return (savestring (p));
-	      }
-	    *p = c;
-
-	  }
-	break;
-
-      case RP_SHORT_LEFT:	/* remove shortest match at start */
-	for (p = param; p <= end; p++)
-	  {
-	    c = *p; *p = '\0';
-	    if (strmatch (pattern, param, FNMATCH_EXTFLAG) != FNM_NOMATCH)
-	      {
-		*p = c;
-		return (savestring (p));
-	      }
-	    *p = c;
-	  }
-	break;
-
-      case RP_LONG_RIGHT:	/* remove longest match at end */
-	for (p = param; p <= end; p++)
-	  {
-	    if (strmatch (pattern, p, FNMATCH_EXTFLAG) != FNM_NOMATCH)
-	      {
-		c = *p; *p = '\0';
-		ret = savestring (param);
-		*p = c;
-		return (ret);
-	      }
-	  }
-	break;
-
-      case RP_SHORT_RIGHT:	/* remove shortest match at end */
-	for (p = end; p >= param; p--)
-	  {
-	    if (strmatch (pattern, p, FNMATCH_EXTFLAG) != FNM_NOMATCH)
-	      {
-		c = *p; *p = '\0';
-		ret = savestring (param);
-		*p = c;
-		return (ret);
-	      }
-	  }
-	break;
-    }
-
-  return (param);	/* no match, return original string */
-}
-
-#if defined (HANDLE_MULTIBYTE)
-/* Returns its first argument if nothing matched; new memory otherwise */
-static wchar_t *
-remove_wpattern (wparam, wstrlen, wpattern, op)
-     wchar_t *wparam;
-     size_t wstrlen;
-     wchar_t *wpattern;
-     int op;
-{
-  wchar_t wc, *ret;
-  int n;
-
-  switch (op)
-    {
-      case RP_LONG_LEFT:	/* remove longest match at start */
-        for (n = wstrlen; n >= 0; n--)
-	  {
-	    wc = wparam[n]; wparam[n] = L'\0';
-	    if (wcsmatch (wpattern, wparam, FNMATCH_EXTFLAG) != FNM_NOMATCH)
-	      {
-		wparam[n] = wc;
-		return (wcsdup (wparam + n));
-	      }
-	    wparam[n] = wc;
-	  }
-	break;
-
-      case RP_SHORT_LEFT:	/* remove shortest match at start */
-	for (n = 0; n <= wstrlen; n++)
-	  {
-	    wc = wparam[n]; wparam[n] = L'\0';
-	    if (wcsmatch (wpattern, wparam, FNMATCH_EXTFLAG) != FNM_NOMATCH)
-	      {
-		wparam[n] = wc;
-		return (wcsdup (wparam + n));
-	      }
-	    wparam[n] = wc;
-	  }
-	break;
-
-      case RP_LONG_RIGHT:	/* remove longest match at end */
-        for (n = 0; n <= wstrlen; n++)
-	  {
-	    if (wcsmatch (wpattern, wparam + n, FNMATCH_EXTFLAG) != FNM_NOMATCH)
-	      {
-		wc = wparam[n]; wparam[n] = L'\0';
-		ret = wcsdup (wparam);
-		wparam[n] = wc;
-		return (ret);
-	      }
-	  }
-	break;
-
-      case RP_SHORT_RIGHT:	/* remove shortest match at end */
-	for (n = wstrlen; n >= 0; n--)
-	  {
-	    if (wcsmatch (wpattern, wparam + n, FNMATCH_EXTFLAG) != FNM_NOMATCH)
-	      {
-		wc = wparam[n]; wparam[n] = L'\0';
-		ret = wcsdup (wparam);
-		wparam[n] = wc;
-		return (ret);
-	      }
-	  }
-	break;
-    }
-
-  return (wparam);	/* no match, return original string */
-}
-#endif /* HANDLE_MULTIBYTE */
-
-static char *
-remove_pattern (param, pattern, op)
-     char *param, *pattern;
-     int op;
-{
-  char *xret;
-
-  if (param == NULL)
-    return (param);
-  if (*param == '\0' || pattern == NULL || *pattern == '\0')	/* minor optimization */
-    return (savestring (param));
-
-#if defined (HANDLE_MULTIBYTE)
-  if (MB_CUR_MAX > 1)
-    {
-      wchar_t *ret, *oret;
-      size_t n;
-      wchar_t *wparam, *wpattern;
-      mbstate_t ps;
-
-      /* XXX - could optimize here by checking param and pattern for multibyte
-	 chars with mbsmbchar and calling remove_upattern. */
-
-      n = xdupmbstowcs (&wpattern, NULL, pattern);
-      if (n == (size_t)-1)
-	{
-	  xret = remove_upattern (param, pattern, op);
-	  return ((xret == param) ? savestring (param) : xret);
-	}
-      n = xdupmbstowcs (&wparam, NULL, param);
-
-      if (n == (size_t)-1)
-	{
-	  free (wpattern);
-	  xret = remove_upattern (param, pattern, op);
-	  return ((xret == param) ? savestring (param) : xret);
-	}
-      oret = ret = remove_wpattern (wparam, n, wpattern, op);
-      /* Don't bother to convert wparam back to multibyte string if nothing
-	 matched; just return copy of original string */
-      if (ret == wparam)
-        {
-          free (wparam);
-          free (wpattern);
-          return (savestring (param));
-        }
-
-      free (wparam);
-      free (wpattern);
-
-      n = strlen (param);
-      xret = (char *)xmalloc (n + 1);
-      memset (&ps, '\0', sizeof (mbstate_t));
-      n = wcsrtombs (xret, (const wchar_t **)&ret, n, &ps);
-      xret[n] = '\0';		/* just to make sure */
-      free (oret);
-      return xret;      
-    }
-  else
-#endif
-    {
-      xret = remove_upattern (param, pattern, op);
-      return ((xret == param) ? savestring (param) : xret);
-    }
-}
-
-/* Match PAT anywhere in STRING and return the match boundaries.
-   This returns 1 in case of a successful match, 0 otherwise.  SP
-   and EP are pointers into the string where the match begins and
-   ends, respectively.  MTYPE controls what kind of match is attempted.
-   MATCH_BEG and MATCH_END anchor the match at the beginning and end
-   of the string, respectively.  The longest match is returned. */
-static int
-match_upattern (string, pat, mtype, sp, ep)
-     char *string, *pat;
-     int mtype;
-     char **sp, **ep;
-{
-  int c, mlen;
-  size_t len;
-  register char *p, *p1, *npat;
-  char *end;
-
-  /* If the pattern doesn't match anywhere in the string, go ahead and
-     short-circuit right away.  A minor optimization, saves a bunch of
-     unnecessary calls to strmatch (up to N calls for a string of N
-     characters) if the match is unsuccessful.  To preserve the semantics
-     of the substring matches below, we make sure that the pattern has
-     `*' as first and last character, making a new pattern if necessary. */
-  /* XXX - check this later if I ever implement `**' with special meaning,
-     since this will potentially result in `**' at the beginning or end */
-  len = STRLEN (pat);
-  if (pat[0] != '*' || (pat[0] == '*' && pat[1] == LPAREN && extended_glob) || pat[len - 1] != '*')
-    {
-      int unescaped_backslash;
-      char *pp;
-
-      p = npat = (char *)xmalloc (len + 3);
-      p1 = pat;
-      if ((mtype != MATCH_BEG) && (*p1 != '*' || (*p1 == '*' && p1[1] == LPAREN && extended_glob)))
-	*p++ = '*';
-      while (*p1)
-	*p++ = *p1++;
-#if 1
-      /* Need to also handle a pattern that ends with an unescaped backslash.
-	 For right now, we ignore it because the pattern matching code will
-	 fail the match anyway */
-      /* If the pattern ends with a `*' we leave it alone if it's preceded by
-	 an even number of backslashes, but if it's escaped by a backslash
-	 we need to add another `*'. */
-      if ((mtype != MATCH_END) && (p1[-1] == '*' && (unescaped_backslash = p1[-2] == '\\')))
-	{
-	  pp = p1 - 3;
-	  while (pp >= pat && *pp-- == '\\')
-	    unescaped_backslash = 1 - unescaped_backslash;
-	  if (unescaped_backslash)
-	    *p++ = '*';
-	}
-      else if (mtype != MATCH_END && p1[-1] != '*')
-	*p++ = '*';
-#else 
-      if (p1[-1] != '*' || p1[-2] == '\\')
-	*p++ = '*';
-#endif
-      *p = '\0';
-    }
-  else
-    npat = pat;
-  c = strmatch (npat, string, FNMATCH_EXTFLAG | FNMATCH_IGNCASE);
-  if (npat != pat)
-    free (npat);
-  if (c == FNM_NOMATCH)
-    return (0);
-
-  len = STRLEN (string);
-  end = string + len;
-
-  mlen = umatchlen (pat, len);
-  if (mlen > (int)len)
-    return (0);
-
-  switch (mtype)
-    {
-    case MATCH_ANY:
-      for (p = string; p <= end; p++)
-	{
-	  if (match_pattern_char (pat, p, FNMATCH_IGNCASE))
-	    {
-	      p1 = (mlen == -1) ? end : p + mlen;
-	      /* p1 - p = length of portion of string to be considered
-	         p = current position in string
-	         mlen = number of characters consumed by match (-1 for entire string)
-	         end = end of string
-	         we want to break immediately if the potential match len
-	         is greater than the number of characters remaining in the
-	         string
-	      */
-	      if (p1 > end)
-		break;
-	      for ( ; p1 >= p; p1--)
-		{
-		  c = *p1; *p1 = '\0';
-		  if (strmatch (pat, p, FNMATCH_EXTFLAG | FNMATCH_IGNCASE) == 0)
-		    {
-		      *p1 = c;
-		      *sp = p;
-		      *ep = p1;
-		      return 1;
-		    }
-		  *p1 = c;
-#if 1
-		  /* If MLEN != -1, we have a fixed length pattern. */
-		  if (mlen != -1)
-		    break;
-#endif
-		}
-	    }
-	}
-
-      return (0);
-
-    case MATCH_BEG:
-      if (match_pattern_char (pat, string, FNMATCH_IGNCASE) == 0)
-	return (0);
-
-      for (p = (mlen == -1) ? end : string + mlen; p >= string; p--)
-	{
-	  c = *p; *p = '\0';
-	  if (strmatch (pat, string, FNMATCH_EXTFLAG | FNMATCH_IGNCASE) == 0)
-	    {
-	      *p = c;
-	      *sp = string;
-	      *ep = p;
-	      return 1;
-	    }
-	  *p = c;
-	  /* If MLEN != -1, we have a fixed length pattern. */
-	  if (mlen != -1)
-	    break;
-	}
-
-      return (0);
-
-    case MATCH_END:
-      for (p = end - ((mlen == -1) ? len : mlen); p <= end; p++)
-	{
-	  if (strmatch (pat, p, FNMATCH_EXTFLAG | FNMATCH_IGNCASE) == 0)
-	    {
-	      *sp = p;
-	      *ep = end;
-	      return 1;
-	    }
-	  /* If MLEN != -1, we have a fixed length pattern. */
-	  if (mlen != -1)
-	    break;
-	}
-
-      return (0);
-    }
-
-  return (0);
-}
-
-#if defined (HANDLE_MULTIBYTE)
-
-#define WFOLD(c) (match_ignore_case && iswupper (c) ? towlower (c) : (c))
-
-/* Match WPAT anywhere in WSTRING and return the match boundaries.
-   This returns 1 in case of a successful match, 0 otherwise.  Wide
-   character version. */
-static int
-match_wpattern (wstring, indices, wstrlen, wpat, mtype, sp, ep)
-     wchar_t *wstring;
-     char **indices;
-     size_t wstrlen;
-     wchar_t *wpat;
-     int mtype;
-     char **sp, **ep;
-{
-  wchar_t wc, *wp, *nwpat, *wp1;
-  size_t len;
-  int mlen;
-  int n, n1, n2, simple;
-
-  simple = (wpat[0] != L'\\' && wpat[0] != L'*' && wpat[0] != L'?' && wpat[0] != L'[');
-#if defined (EXTENDED_GLOB)
-  if (extended_glob)
-    simple &= (wpat[1] != L'(' || (wpat[0] != L'*' && wpat[0] != L'?' && wpat[0] != L'+' && wpat[0] != L'!' && wpat[0] != L'@')); /*)*/
-#endif
-
-  /* If the pattern doesn't match anywhere in the string, go ahead and
-     short-circuit right away.  A minor optimization, saves a bunch of
-     unnecessary calls to strmatch (up to N calls for a string of N
-     characters) if the match is unsuccessful.  To preserve the semantics
-     of the substring matches below, we make sure that the pattern has
-     `*' as first and last character, making a new pattern if necessary. */
-  len = wcslen (wpat);
-  if (wpat[0] != L'*' || (wpat[0] == L'*' && wpat[1] == WLPAREN && extended_glob) || wpat[len - 1] != L'*')
-    {
-      int unescaped_backslash;
-      wchar_t *wpp;
-
-      wp = nwpat = (wchar_t *)xmalloc ((len + 3) * sizeof (wchar_t));
-      wp1 = wpat;
-      if (*wp1 != L'*' || (*wp1 == '*' && wp1[1] == WLPAREN && extended_glob))
-	*wp++ = L'*';
-      while (*wp1 != L'\0')
-	*wp++ = *wp1++;
-#if 1
-      /* See comments above in match_upattern. */
-      if (wp1[-1] == L'*' && (unescaped_backslash = wp1[-2] == L'\\'))
-        {
-          wpp = wp1 - 3;
-          while (wpp >= wpat && *wpp-- == L'\\')
-            unescaped_backslash = 1 - unescaped_backslash;
-          if (unescaped_backslash)
-            *wp++ = L'*';
-        }
-      else if (wp1[-1] != L'*')
-        *wp++ = L'*';
-#else      
-      if (wp1[-1] != L'*' || wp1[-2] == L'\\')
-        *wp++ = L'*';
-#endif
-      *wp = '\0';
-    }
-  else
-    nwpat = wpat;
-  len = wcsmatch (nwpat, wstring, FNMATCH_EXTFLAG | FNMATCH_IGNCASE);
-  if (nwpat != wpat)
-    free (nwpat);
-  if (len == FNM_NOMATCH)
-    return (0);
-
-  mlen = wmatchlen (wpat, wstrlen);
-  if (mlen > (int)wstrlen)
-    return (0);
-
-/* itrace("wmatchlen (%ls) -> %d", wpat, mlen); */
-  switch (mtype)
-    {
-    case MATCH_ANY:
-      for (n = 0; n <= wstrlen; n++)
-	{
-	  n2 = simple ? (WFOLD(*wpat) == WFOLD(wstring[n])) : match_pattern_wchar (wpat, wstring + n, FNMATCH_IGNCASE);
-	  if (n2)
-	    {
-	      n1 = (mlen == -1) ? wstrlen : n + mlen;
-	      if (n1 > wstrlen)
-	        break;
-
-	      for ( ; n1 >= n; n1--)
-		{
-		  wc = wstring[n1]; wstring[n1] = L'\0';
-		  if (wcsmatch (wpat, wstring + n, FNMATCH_EXTFLAG | FNMATCH_IGNCASE) == 0)
-		    {
-		      wstring[n1] = wc;
-		      *sp = indices[n];
-		      *ep = indices[n1];
-		      return 1;
-		    }
-		  wstring[n1] = wc;
-		  /* If MLEN != -1, we have a fixed length pattern. */
-		  if (mlen != -1)
-		    break;
-		}
-	    }
-	}
-
-      return (0);
-
-    case MATCH_BEG:
-      if (match_pattern_wchar (wpat, wstring, FNMATCH_IGNCASE) == 0)
-	return (0);
-
-      for (n = (mlen == -1) ? wstrlen : mlen; n >= 0; n--)
-	{
-	  wc = wstring[n]; wstring[n] = L'\0';
-	  if (wcsmatch (wpat, wstring, FNMATCH_EXTFLAG | FNMATCH_IGNCASE) == 0)
-	    {
-	      wstring[n] = wc;
-	      *sp = indices[0];
-	      *ep = indices[n];
-	      return 1;
-	    }
-	  wstring[n] = wc;
-	  /* If MLEN != -1, we have a fixed length pattern. */
-	  if (mlen != -1)
-	    break;
-	}
-
-      return (0);
-
-    case MATCH_END:
-      for (n = wstrlen - ((mlen == -1) ? wstrlen : mlen); n <= wstrlen; n++)
-	{
-	  if (wcsmatch (wpat, wstring + n, FNMATCH_EXTFLAG | FNMATCH_IGNCASE) == 0)
-	    {
-	      *sp = indices[n];
-	      *ep = indices[wstrlen];
-	      return 1;
-	    }
-	  /* If MLEN != -1, we have a fixed length pattern. */
-	  if (mlen != -1)
-	    break;
-	}
-
-      return (0);
-    }
-
-  return (0);
-}
-#undef WFOLD
-#endif /* HANDLE_MULTIBYTE */
-
-static int
-match_pattern (string, pat, mtype, sp, ep)
-     char *string, *pat;
-     int mtype;
-     char **sp, **ep;
-{
-#if defined (HANDLE_MULTIBYTE)
-  int ret;
-  size_t n;
-  wchar_t *wstring, *wpat;
-  char **indices;
-#endif
-
-  if (string == 0 || pat == 0 || *pat == 0)
-    return (0);
-
-#if defined (HANDLE_MULTIBYTE)
-  if (MB_CUR_MAX > 1)
-    {
-      if (mbsmbchar (string) == 0 && mbsmbchar (pat) == 0)
-        return (match_upattern (string, pat, mtype, sp, ep));
-
-      n = xdupmbstowcs (&wpat, NULL, pat);
-      if (n == (size_t)-1)
-	return (match_upattern (string, pat, mtype, sp, ep));
-      n = xdupmbstowcs (&wstring, &indices, string);
-      if (n == (size_t)-1)
-	{
-	  free (wpat);
-	  return (match_upattern (string, pat, mtype, sp, ep));
-	}
-      ret = match_wpattern (wstring, indices, n, wpat, mtype, sp, ep);
-
-      free (wpat);
-      free (wstring);
-      free (indices);
-
-      return (ret);
-    }
-  else
-#endif
-    return (match_upattern (string, pat, mtype, sp, ep));
-}
-
-static int
-getpatspec (c, value)
-     int c;
-     char *value;
-{
-  if (c == '#')
-    return ((*value == '#') ? RP_LONG_LEFT : RP_SHORT_LEFT);
-  else	/* c == '%' */
-    return ((*value == '%') ? RP_LONG_RIGHT : RP_SHORT_RIGHT);
-}
-
-/* Posix.2 says that the WORD should be run through tilde expansion,
-   parameter expansion, command substitution and arithmetic expansion.
-   This leaves the result quoted, so quote_string_for_globbing () has
-   to be called to fix it up for strmatch ().  If QUOTED is non-zero,
-   it means that the entire expression was enclosed in double quotes.
-   This means that quoting characters in the pattern do not make any
-   special pattern characters quoted.  For example, the `*' in the
-   following retains its special meaning: "${foo#'*'}". */
-static char *
-getpattern (value, quoted, expandpat)
-     char *value;
-     int quoted, expandpat;
-{
-  char *pat, *tword;
-  WORD_LIST *l;
-#if 0
-  int i;
-#endif
-  /* There is a problem here:  how to handle single or double quotes in the
-     pattern string when the whole expression is between double quotes?
-     POSIX.2 says that enclosing double quotes do not cause the pattern to
-     be quoted, but does that leave us a problem with @ and array[@] and their
-     expansions inside a pattern? */
-#if 0
-  if (expandpat && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) && *tword)
-    {
-      i = 0;
-      pat = string_extract_double_quoted (tword, &i, SX_STRIPDQ);
-      free (tword);
-      tword = pat;
-    }
-#endif
-
-  /* expand_string_for_pat () leaves WORD quoted and does not perform
-     word splitting. */
-  l = *value ? expand_string_for_pat (value,
-				      (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) ? Q_PATQUOTE : quoted,
-				      (int *)NULL, (int *)NULL)
-	     : (WORD_LIST *)0;
-  if (l)
-    word_list_remove_quoted_nulls (l);
-  pat = string_list (l);
-  dispose_words (l);
-  if (pat)
-    {
-      tword = quote_string_for_globbing (pat, QGLOB_CVTNULL);
-      free (pat);
-      pat = tword;
-    }
-  return (pat);
-}
-
-#if 0
-/* Handle removing a pattern from a string as a result of ${name%[%]value}
-   or ${name#[#]value}. */
-static char *
-variable_remove_pattern (value, pattern, patspec, quoted)
-     char *value, *pattern;
-     int patspec, quoted;
-{
-  char *tword;
-
-  tword = remove_pattern (value, pattern, patspec);
-
-  return (tword);
-}
-#endif
-
-static char *
-list_remove_pattern (list, pattern, patspec, itype, quoted)
-     WORD_LIST *list;
-     char *pattern;
-     int patspec, itype, quoted;
-{
-  WORD_LIST *new, *l;
-  WORD_DESC *w;
-  char *tword;
-
-  for (new = (WORD_LIST *)NULL, l = list; l; l = l->next)
-    {
-      tword = remove_pattern (l->word->word, pattern, patspec);
-      w = alloc_word_desc ();
-      w->word = tword ? tword : savestring ("");
-      new = make_word_list (w, new);
-    }
-
-  l = REVERSE_LIST (new, WORD_LIST *);
-  tword = string_list_pos_params (itype, l, quoted, 0);
-  dispose_words (l);
-
-  return (tword);
-}
-
-static char *
-parameter_list_remove_pattern (itype, pattern, patspec, quoted)
-     int itype;
-     char *pattern;
-     int patspec, quoted;
-{
-  char *ret;
-  WORD_LIST *list;
-
-  list = list_rest_of_args ();
-  if (list == 0)
-    return ((char *)NULL);
-  ret = list_remove_pattern (list, pattern, patspec, itype, quoted);
-  dispose_words (list);
-  return (ret);
-}
-
-#if defined (ARRAY_VARS)
-static char *
-array_remove_pattern (var, pattern, patspec, starsub, quoted)
-     SHELL_VAR *var;
-     char *pattern;
-     int patspec;
-     int starsub;	/* so we can figure out how it's indexed */
-     int quoted;
-{
-  ARRAY *a;
-  HASH_TABLE *h;
-  int itype;
-  char *ret;
-  WORD_LIST *list;
-  SHELL_VAR *v;
-
-  v = var;		/* XXX - for now */
-
-  itype = starsub ? '*' : '@';
-
-  a = (v && array_p (v)) ? array_cell (v) : 0;
-  h = (v && assoc_p (v)) ? assoc_cell (v) : 0;
-  
-  list = a ? array_to_word_list (a) : (h ? assoc_to_word_list (h) : 0);
-  if (list == 0)
-   return ((char *)NULL);
-  ret = list_remove_pattern (list, pattern, patspec, itype, quoted);
-  dispose_words (list);
-
-  return ret;
-}
-#endif /* ARRAY_VARS */
-
-static char *
-parameter_brace_remove_pattern (varname, value, estatep, patstr, rtype, quoted, flags)
-     char *varname, *value;
-     array_eltstate_t *estatep;
-     char *patstr;
-     int rtype, quoted, flags;
-{
-  int vtype, patspec, starsub;
-  char *temp1, *val, *pattern, *oname;
-  SHELL_VAR *v;
-
-  if (value == 0)
-    return ((char *)NULL);
-
-  oname = this_command_name;
-  this_command_name = varname;
-
-  vtype = get_var_and_type (varname, value, estatep, quoted, flags, &v, &val);
-  if (vtype == -1)
-    {
-      this_command_name = oname;
-      return ((char *)NULL);
-    }
-
-  starsub = vtype & VT_STARSUB;
-  vtype &= ~VT_STARSUB;
-
-  patspec = getpatspec (rtype, patstr);
-  if (patspec == RP_LONG_LEFT || patspec == RP_LONG_RIGHT)
-    patstr++;
-
-  /* Need to pass getpattern newly-allocated memory in case of expansion --
-     the expansion code will free the passed string on an error. */
-  temp1 = savestring (patstr);
-  pattern = getpattern (temp1, quoted, 1);
-  free (temp1);
-
-  temp1 = (char *)NULL;		/* shut up gcc */
-  switch (vtype)
-    {
-    case VT_VARIABLE:
-    case VT_ARRAYMEMBER:
-      temp1 = remove_pattern (val, pattern, patspec);
-      if (vtype == VT_VARIABLE)
-	FREE (val);
-      if (temp1)
-	{
-	  val = (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
-			? quote_string (temp1)
-			: quote_escapes (temp1);
-	  free (temp1);
-	  temp1 = val;
-	}
-      break;
-#if defined (ARRAY_VARS)
-    case VT_ARRAYVAR:
-      temp1 = array_remove_pattern (v, pattern, patspec, starsub, quoted);
-      if (temp1 && ((quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) == 0))
-	{
-	  val = quote_escapes (temp1);
-	  free (temp1);
-	  temp1 = val;
-	}
-      break;
-#endif
-    case VT_POSPARMS:
-      temp1 = parameter_list_remove_pattern (varname[0], pattern, patspec, quoted);
-      if (temp1 && quoted == 0 && ifs_is_null)
-	{
-	  /* Posix interp 888 */
-	}
-      else if (temp1 && ((quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) == 0))
-	{
-	  val = quote_escapes (temp1);
-	  free (temp1);
-	  temp1 = val;
-	}
-      break;
-    }
-
-  this_command_name = oname;
-
-  FREE (pattern);
-  return temp1;
-}    
-
+/* Process substitution functions moved to subst_procsub.c */
 #if defined (PROCESS_SUBSTITUTION)
-
-static void reap_some_procsubs PARAMS((int));
-
-/*****************************************************************/
-/*								 */
-/*		    Hacking Process Substitution		 */
-/*								 */
-/*****************************************************************/
-
-#if !defined (HAVE_DEV_FD)
-/* Named pipes must be removed explicitly with `unlink'.  This keeps a list
-   of FIFOs the shell has open.  unlink_fifo_list will walk the list and
-   unlink the ones that don't have a living process on the other end.
-   unlink_all_fifos will walk the list and unconditionally unlink them, trying
-   to open and close the FIFO first to release any child processes sleeping on
-   the FIFO. add_fifo_list adds the name of an open FIFO to the list. 
-   NFIFO is a count of the number of FIFOs in the list. */
-#define FIFO_INCR 20
-
-/* PROC value of -1 means the process has been reaped and the FIFO needs to
-   be removed. PROC value of 0 means the slot is unused. */
-struct temp_fifo {
-  char *file;
-  pid_t proc;
-};
-
-static struct temp_fifo *fifo_list = (struct temp_fifo *)NULL;
-static int nfifo;
-static int fifo_list_size;
-
-void
-clear_fifo_list ()
-{
-  int i;
-
-  for (i = 0; i < fifo_list_size; i++)
-    {
-      if (fifo_list[i].file)
-	free (fifo_list[i].file);
-      fifo_list[i].file = NULL;
-      fifo_list[i].proc = 0;
-    }
-  nfifo = 0;
-}
-
-void *
-copy_fifo_list (sizep)
-     int *sizep;
-{
-  if (sizep)
-    *sizep = 0;
-  return (void *)NULL;
-}
-
-static void
-add_fifo_list (pathname)
-     char *pathname;
-{
-  int osize, i;
-
-  if (nfifo >= fifo_list_size - 1)
-    {
-      osize = fifo_list_size;
-      fifo_list_size += FIFO_INCR;
-      fifo_list = (struct temp_fifo *)xrealloc (fifo_list,
-				fifo_list_size * sizeof (struct temp_fifo));
-      for (i = osize; i < fifo_list_size; i++)
-	{
-	  fifo_list[i].file = (char *)NULL;
-	  fifo_list[i].proc = 0;	/* unused */
-	}
-    }
-
-  fifo_list[nfifo].file = savestring (pathname);
-  nfifo++;
-}
-
-void
-unlink_fifo (i)
-     int i;
-{
-  if ((fifo_list[i].proc == (pid_t)-1) || (fifo_list[i].proc > 0 && (kill(fifo_list[i].proc, 0) == -1)))
-    {
-      unlink (fifo_list[i].file);
-      free (fifo_list[i].file);
-      fifo_list[i].file = (char *)NULL;
-      fifo_list[i].proc = 0;
-    }
-}
-
-void
-unlink_fifo_list ()
-{
-  int saved, i, j;
-
-  if (nfifo == 0)
-    return;
-
-  for (i = saved = 0; i < nfifo; i++)
-    {
-      if ((fifo_list[i].proc == (pid_t)-1) || (fifo_list[i].proc > 0 && (kill(fifo_list[i].proc, 0) == -1)))
-	{
-	  unlink (fifo_list[i].file);
-	  free (fifo_list[i].file);
-	  fifo_list[i].file = (char *)NULL;
-	  fifo_list[i].proc = 0;
-	}
-      else
-	saved++;
-    }
-
-  /* If we didn't remove some of the FIFOs, compact the list. */
-  if (saved)
-    {
-      for (i = j = 0; i < nfifo; i++)
-	if (fifo_list[i].file)
-	  {
-	    if (i != j)
-	      {
-		fifo_list[j].file = fifo_list[i].file;
-		fifo_list[j].proc = fifo_list[i].proc;
-		fifo_list[i].file = (char *)NULL;
-		fifo_list[i].proc = 0;
-	      }
-	    j++;
-	  }
-      nfifo = j;
-    }
-  else
-    nfifo = 0;
-}
-
-void
-unlink_all_fifos ()
-{
-  int i, fd;
-
-  if (nfifo == 0)
-    return;
-
-  for (i = 0; i < nfifo; i++)
-    {
-      fifo_list[i].proc = (pid_t)-1;
-#if defined (O_NONBLOCK)
-      fd = open (fifo_list[i].file, O_RDWR|O_NONBLOCK);
-#else
-      fd = -1;
-#endif
-      unlink_fifo (i);
-      if (fd >= 0)
-	close (fd);
-    }
-
-  nfifo = 0;
-}
-
-/* Take LIST, which is a bitmap denoting active FIFOs in fifo_list
-   from some point in the past, and close all open FIFOs in fifo_list
-   that are not marked as active in LIST.  If LIST is NULL, close
-   everything in fifo_list. LSIZE is the number of elements in LIST, in
-   case it's larger than fifo_list_size (size of fifo_list). */
-void
-close_new_fifos (list, lsize)
-     void *list;
-     int lsize;
-{
-  int i;
-  char *plist;
-
-  if (list == 0)
-    {
-      unlink_fifo_list ();
-      return;
-    }
-
-  for (plist = (char *)list, i = 0; i < lsize; i++)
-    if (plist[i] == 0 && i < fifo_list_size && fifo_list[i].proc != -1)
-      unlink_fifo (i);
-
-  for (i = lsize; i < fifo_list_size; i++)
-    unlink_fifo (i);  
-}
-
-int
-find_procsub_child (pid)
-     pid_t pid;
-{
-  int i;
-
-  for (i = 0; i < nfifo; i++)
-    if (fifo_list[i].proc == pid)
-      return i;
-  return -1;
-}
-
-void
-set_procsub_status (ind, pid, status)
-     int ind;
-     pid_t pid;
-     int status;
-{
-  if (ind >= 0 && ind < nfifo)
-    fifo_list[ind].proc = (pid_t)-1;		/* sentinel */
-}
-
-/* If we've marked the process for this procsub as dead, close the
-   associated file descriptor and delete the FIFO. */
-static void
-reap_some_procsubs (max)
-     int max;
-{
-  int i;
-
-  for (i = 0; i < max; i++)
-    if (fifo_list[i].proc == (pid_t)-1)	/* reaped */
-      unlink_fifo (i);
-}
-
-void
-reap_procsubs ()
-{
-  reap_some_procsubs (nfifo);
-}
-
-#if 0
-/* UNUSED */
-void
-wait_procsubs ()
-{
-  int i, r;
-
-  for (i = 0; i < nfifo; i++)
-    {
-      if (fifo_list[i].proc != (pid_t)-1 && fifo_list[i].proc > 0)
-	{
-	  r = wait_for (fifo_list[i].proc, 0);
-	  save_proc_status (fifo_list[i].proc, r);
-	  fifo_list[i].proc = (pid_t)-1;
-	}
-    }
-}
-#endif
-
-int
-fifos_pending ()
-{
-  return nfifo;
-}
-
-int
-num_fifos ()
-{
-  return nfifo;
-}
-
-static char *
-make_named_pipe ()
-{
-  char *tname;
-
-  tname = sh_mktmpname ("sh-np", MT_USERANDOM|MT_USETMPDIR);
-  if (mkfifo (tname, 0600) < 0)
-    {
-      free (tname);
-      return ((char *)NULL);
-    }
-
-  add_fifo_list (tname);
-  return (tname);
-}
-
-#else /* HAVE_DEV_FD */
-
-/* DEV_FD_LIST is a bitmap of file descriptors attached to pipes the shell
-   has open to children.  NFDS is a count of the number of bits currently
-   set in DEV_FD_LIST.  TOTFDS is a count of the highest possible number
-   of open files. */
-/* dev_fd_list[I] value of -1 means the process has been reaped and file
-   descriptor I needs to be closed. Value of 0 means the slot is unused. */
-
-static pid_t *dev_fd_list = (pid_t *)NULL;
-static int nfds;
-static int totfds;	/* The highest possible number of open files. */
-
-void
-clear_fifo (i)
-     int i;
-{
-  if (dev_fd_list[i])
-    {
-      dev_fd_list[i] = 0;
-      nfds--;
-    }
-}
-
-void
-clear_fifo_list ()
-{
-  register int i;
-
-  if (nfds == 0)
-    return;
-
-  for (i = 0; nfds && i < totfds; i++)
-    clear_fifo (i);
-
-  nfds = 0;
-}
-
-void *
-copy_fifo_list (sizep)
-     int *sizep;
-{
-  void *ret;
-
-  if (nfds == 0 || totfds == 0)
-    {
-      if (sizep)
-	*sizep = 0;
-      return (void *)NULL;
-    }
-
-  if (sizep)
-    *sizep = totfds;
-  ret = xmalloc (totfds * sizeof (pid_t));
-  return (memcpy (ret, dev_fd_list, totfds * sizeof (pid_t)));
-}
-
-static void
-add_fifo_list (fd)
-     int fd;
-{
-  if (dev_fd_list == 0 || fd >= totfds)
-    {
-      int ofds;
-
-      ofds = totfds;
-      totfds = getdtablesize ();
-      if (totfds < 0 || totfds > 256)
-	totfds = 256;
-      if (fd >= totfds)
-	totfds = fd + 2;
-
-      dev_fd_list = (pid_t *)xrealloc (dev_fd_list, totfds * sizeof (dev_fd_list[0]));
-      /* XXX - might need a loop for this */
-      memset (dev_fd_list + ofds, '\0', (totfds - ofds) * sizeof (pid_t));
-    }
-
-  dev_fd_list[fd] = 1;		/* marker; updated later */
-  nfds++;
-}
-
-int
-fifos_pending ()
-{
-  return 0;	/* used for cleanup; not needed with /dev/fd */
-}
-
-int
-num_fifos ()
-{
-  return nfds;
-}
-
-void
-unlink_fifo (fd)
-     int fd;
-{
-  if (dev_fd_list[fd])
-    {
-      close (fd);
-      dev_fd_list[fd] = 0;
-      nfds--;
-    }
-}
-
-void
-unlink_fifo_list ()
-{
-  register int i;
-
-  if (nfds == 0)
-    return;
-
-  for (i = totfds-1; nfds && i >= 0; i--)
-    unlink_fifo (i);
-
-  nfds = 0;
-}
-
-void
-unlink_all_fifos ()
-{
-  unlink_fifo_list ();
-}
-
-/* Take LIST, which is a snapshot copy of dev_fd_list from some point in
-   the past, and close all open fds in dev_fd_list that are not marked
-   as open in LIST.  If LIST is NULL, close everything in dev_fd_list.
-   LSIZE is the number of elements in LIST, in case it's larger than
-   totfds (size of dev_fd_list). */
-void
-close_new_fifos (list, lsize)
-     void *list;
-     int lsize;
-{
-  int i;
-  pid_t *plist;
-
-  if (list == 0)
-    {
-      unlink_fifo_list ();
-      return;
-    }
-
-  for (plist = (pid_t *)list, i = 0; i < lsize; i++)
-    if (plist[i] == 0 && i < totfds && dev_fd_list[i])
-      unlink_fifo (i);
-
-  for (i = lsize; i < totfds; i++)
-    unlink_fifo (i);  
-}
-
-int
-find_procsub_child (pid)
-     pid_t pid;
-{
-  int i;
-
-  if (nfds == 0)
-    return -1;
-
-  for (i = 0; i < totfds; i++)
-    if (dev_fd_list[i] == pid)
-      return i;
-
-  return -1;
-}
-
-void
-set_procsub_status (ind, pid, status)
-     int ind;
-     pid_t pid;
-     int status;
-{
-  if (ind >= 0 && ind < totfds)
-    dev_fd_list[ind] = (pid_t)-1;		/* sentinel */
-}
-
-/* If we've marked the process for this procsub as dead, close the
-   associated file descriptor. */
-static void
-reap_some_procsubs (max)
-     int max;
-{
-  int i;
-
-  for (i = 0; nfds > 0 && i < max; i++)
-    if (dev_fd_list[i] == (pid_t)-1)
-      unlink_fifo (i);
-}
-
-void
-reap_procsubs ()
-{
-  reap_some_procsubs (totfds);
-}
-
-#if 0
-/* UNUSED */
-void
-wait_procsubs ()
-{
-  int i, r;
-
-  for (i = 0; nfds > 0 && i < totfds; i++)
-    {
-      if (dev_fd_list[i] != (pid_t)-1 && dev_fd_list[i] > 0)
-	{
-	  r = wait_for (dev_fd_list[i], 0);
-	  save_proc_status (dev_fd_list[i], r);
-	  dev_fd_list[i] = (pid_t)-1;
-	}
-    }
-}
-#endif
-
-#if defined (NOTDEF)
-print_dev_fd_list ()
-{
-  register int i;
-
-  fprintf (stderr, "pid %ld: dev_fd_list:", (long)getpid ());
-  fflush (stderr);
-
-  for (i = 0; i < totfds; i++)
-    {
-      if (dev_fd_list[i])
-	fprintf (stderr, " %d", i);
-    }
-  fprintf (stderr, "\n");
-}
-#endif /* NOTDEF */
-
-static char *
-make_dev_fd_filename (fd)
-     int fd;
-{
-  char *ret, intbuf[INT_STRLEN_BOUND (int) + 1], *p;
-
-  ret = (char *)xmalloc (sizeof (DEV_FD_PREFIX) + 8);
-
-  strcpy (ret, DEV_FD_PREFIX);
-  p = inttostr (fd, intbuf, sizeof (intbuf));
-  strcpy (ret + sizeof (DEV_FD_PREFIX) - 1, p);
-
-  add_fifo_list (fd);
-  return (ret);
-}
-
-#endif /* HAVE_DEV_FD */
-
-/* Return a filename that will open a connection to the process defined by
-   executing STRING.  HAVE_DEV_FD, if defined, means open a pipe and return
-   a filename in /dev/fd corresponding to a descriptor that is one of the
-   ends of the pipe.  If not defined, we use named pipes on systems that have
-   them.  Systems without /dev/fd and named pipes are out of luck.
-
-   OPEN_FOR_READ_IN_CHILD, if 1, means open the named pipe for reading or
-   use the read end of the pipe and dup that file descriptor to fd 0 in
-   the child.  If OPEN_FOR_READ_IN_CHILD is 0, we open the named pipe for
-   writing or use the write end of the pipe in the child, and dup that
-   file descriptor to fd 1 in the child.  The parent does the opposite. */
-
-static char *
-process_substitute (string, open_for_read_in_child)
-     char *string;
-     int open_for_read_in_child;
-{
-  char *pathname;
-  int fd, result, rc, function_value;
-  pid_t old_pid, pid;
-#if defined (HAVE_DEV_FD)
-  int parent_pipe_fd, child_pipe_fd;
-  int fildes[2];
-#endif /* HAVE_DEV_FD */
-#if defined (JOB_CONTROL)
-  pid_t old_pipeline_pgrp;
-#endif
-
-  if (!string || !*string || wordexp_only)
-    return ((char *)NULL);
-
-#if !defined (HAVE_DEV_FD)
-  pathname = make_named_pipe ();
-#else /* HAVE_DEV_FD */
-  if (pipe (fildes) < 0)
-    {
-      sys_error ("%s", _("cannot make pipe for process substitution"));
-      return ((char *)NULL);
-    }
-  /* If OPEN_FOR_READ_IN_CHILD == 1, we want to use the write end of
-     the pipe in the parent, otherwise the read end. */
-  parent_pipe_fd = fildes[open_for_read_in_child];
-  child_pipe_fd = fildes[1 - open_for_read_in_child];
-  /* Move the parent end of the pipe to some high file descriptor, to
-     avoid clashes with FDs used by the script. */
-  parent_pipe_fd = move_to_high_fd (parent_pipe_fd, 1, 64);
-
-  pathname = make_dev_fd_filename (parent_pipe_fd);
-#endif /* HAVE_DEV_FD */
-
-  if (pathname == 0)
-    {
-      sys_error ("%s", _("cannot make pipe for process substitution"));
-      return ((char *)NULL);
-    }
-
-  old_pid = last_made_pid;
-
-#if defined (JOB_CONTROL)
-  old_pipeline_pgrp = pipeline_pgrp;
-  if (pipeline_pgrp == 0 || (subshell_environment & (SUBSHELL_PIPE|SUBSHELL_FORK|SUBSHELL_ASYNC)) == 0)
-    pipeline_pgrp = shell_pgrp;
-  save_pipeline (1);
-#endif /* JOB_CONTROL */
-
-  pid = make_child ((char *)NULL, FORK_ASYNC);
-  if (pid == 0)
-    {
-#if 0
-      int old_interactive;
-
-      old_interactive = interactive;
-#endif
-      /* The currently-executing shell is not interactive */
-      interactive = 0;
-
-      reset_terminating_signals ();	/* XXX */
-      free_pushed_string_input ();
-      /* Cancel traps, in trap.c. */
-      restore_original_signals ();	/* XXX - what about special builtins? bash-4.2 */
-      subshell_environment &= ~SUBSHELL_IGNTRAP;
-      QUIT;	/* catch any interrupts we got post-fork */
-      setup_async_signals ();
-#if 0
-      if (open_for_read_in_child == 0 && old_interactive && (bash_input.type == st_stdin || bash_input.type == st_stream))
-	async_redirect_stdin ();
-#endif
-
-      subshell_environment |= SUBSHELL_COMSUB|SUBSHELL_PROCSUB|SUBSHELL_ASYNC;
-
-      /* We don't inherit the verbose option for command substitutions now, so
-	 let's try it for process substitutions. */
-      change_flag ('v', FLAG_OFF);
-
-      /* if we're expanding a redirection, we shouldn't have access to the
-	 temporary environment, but commands in the subshell should have
-	 access to their own temporary environment. */
-      if (expanding_redir)
-        flush_temporary_env ();
-    }
-
-#if defined (JOB_CONTROL)
-  set_sigchld_handler ();
-  stop_making_children ();
-  /* XXX - should we only do this in the parent? (as in command subst) */
-  pipeline_pgrp = old_pipeline_pgrp;
-#else
-  stop_making_children ();
-#endif /* JOB_CONTROL */
-
-  if (pid < 0)
-    {
-      sys_error ("%s", _("cannot make child for process substitution"));
-      free (pathname);
-#if defined (HAVE_DEV_FD)
-      close (parent_pipe_fd);
-      close (child_pipe_fd);
-#endif /* HAVE_DEV_FD */
-#if defined (JOB_CONTROL)
-      restore_pipeline (1);
-#endif
-      return ((char *)NULL);
-    }
-
-  if (pid > 0)
-    {
-#if defined (JOB_CONTROL)
-      last_procsub_child = restore_pipeline (0);
-      /* We assume that last_procsub_child->next == last_procsub_child because
-	 of how jobs.c:add_process() works. */
-      last_procsub_child->next = 0;
-      procsub_add (last_procsub_child);
-#endif
-
-#if defined (HAVE_DEV_FD)
-      dev_fd_list[parent_pipe_fd] = pid;
-#else
-      fifo_list[nfifo-1].proc = pid;
-#endif
-
-      last_made_pid = old_pid;
-
-#if defined (JOB_CONTROL) && defined (PGRP_PIPE)
-      close_pgrp_pipe ();
-#endif /* JOB_CONTROL && PGRP_PIPE */
-
-#if defined (HAVE_DEV_FD)
-      close (child_pipe_fd);
-#endif /* HAVE_DEV_FD */
-
-      return (pathname);
-    }
-
-  set_sigint_handler ();
-
-#if defined (JOB_CONTROL)
-  /* make sure we don't have any job control */
-  set_job_control (0);
-
-  /* Clear out any existing list of process substitutions */
-  procsub_clear ();
-
-  /* The idea is that we want all the jobs we start from an async process
-     substitution to be in the same process group, but not the same pgrp
-     as our parent shell, since we don't want to affect our parent shell's
-     jobs if we get a SIGHUP and end up calling hangup_all_jobs, for example.
-     If pipeline_pgrp != shell_pgrp, we assume that there is a job control
-     shell somewhere in our parent process chain (since make_child initializes
-     pipeline_pgrp to shell_pgrp if job_control == 0). What we do in this
-     case is to set pipeline_pgrp to our PID, so all jobs started by this
-     process have that same pgrp and we are basically the process group leader.
-     This should not have negative effects on child processes surviving
-     after we exit, since we wait for the children we create, but that is
-     something to watch for. */
-
-  if (pipeline_pgrp != shell_pgrp)
-    pipeline_pgrp = getpid ();
-#endif /* JOB_CONTROL */
-
-#if !defined (HAVE_DEV_FD)
-  /* Open the named pipe in the child. */
-  fd = open (pathname, open_for_read_in_child ? O_RDONLY : O_WRONLY);
-  if (fd < 0)
-    {
-      /* Two separate strings for ease of translation. */
-      if (open_for_read_in_child)
-	sys_error (_("cannot open named pipe %s for reading"), pathname);
-      else
-	sys_error (_("cannot open named pipe %s for writing"), pathname);
-
-      exit (127);
-    }
-  if (open_for_read_in_child)
-    {
-      if (sh_unset_nodelay_mode (fd) < 0)
-	{
-	  sys_error (_("cannot reset nodelay mode for fd %d"), fd);
-	  exit (127);
-	}
-    }
-#else /* HAVE_DEV_FD */
-  fd = child_pipe_fd;
-#endif /* HAVE_DEV_FD */
-
-  /* Discard  buffered stdio output before replacing the underlying file
-     descriptor. */
-  if (open_for_read_in_child == 0)
-    fpurge (stdout);
-
-  if (dup2 (fd, open_for_read_in_child ? 0 : 1) < 0)
-    {
-      sys_error (_("cannot duplicate named pipe %s as fd %d"), pathname,
-	open_for_read_in_child ? 0 : 1);
-      exit (127);
-    }
-
-  if (fd != (open_for_read_in_child ? 0 : 1))
-    close (fd);
-
-  /* Need to close any files that this process has open to pipes inherited
-     from its parent. */
-  if (current_fds_to_close)
-    {
-      close_fd_bitmap (current_fds_to_close);
-      current_fds_to_close = (struct fd_bitmap *)NULL;
-    }
-
-#if defined (HAVE_DEV_FD)
-  /* Make sure we close the parent's end of the pipe and clear the slot
-     in the fd list so it is not closed later, if reallocated by, for
-     instance, pipe(2). */
-  close (parent_pipe_fd);
-  dev_fd_list[parent_pipe_fd] = 0;
-#endif /* HAVE_DEV_FD */
-
-  /* subshells shouldn't have this flag, which controls using the temporary
-     environment for variable lookups.  We have already flushed the temporary
-     environment above in the case we're expanding a redirection, so processes
-     executed by this command need to be able to set it independently of their
-     parent. */
-  expanding_redir = 0;
-
-  remove_quoted_escapes (string);
-
-  startup_state = 2;	/* see if we can avoid a fork */
-  parse_and_execute_level = 0;
-
-  /* Give process substitution a place to jump back to on failure,
-     so we don't go back up to main (). */
-  result = setjmp_nosigs (top_level);
-
-  /* If we're running a process substitution inside a shell function,
-     trap `return' so we don't return from the function in the subshell
-     and go off to never-never land. */
-  if (result == 0 && return_catch_flag)
-    function_value = setjmp_nosigs (return_catch);
-  else
-    function_value = 0;
-
-  if (result == ERREXIT)
-    rc = last_command_exit_value;
-  else if (result == EXITPROG || result == EXITBLTIN)
-    rc = last_command_exit_value;
-  else if (result)
-    rc = EXECUTION_FAILURE;
-  else if (function_value)
-    rc = return_catch_value;
-  else
-    {
-      subshell_level++;
-      rc = parse_and_execute (string, "process substitution", (SEVAL_NONINT|SEVAL_NOHIST));
-      /* leave subshell level intact for any exit trap */
-    }
-
-#if !defined (HAVE_DEV_FD)
-  /* Make sure we close the named pipe in the child before we exit. */
-  close (open_for_read_in_child ? 0 : 1);
-#endif /* !HAVE_DEV_FD */
-
-  last_command_exit_value = rc;
-  rc = run_exit_trap ();
-  exit (rc);
-  /*NOTREACHED*/
-}
+#include "subst_procsub.h"
 #endif /* PROCESS_SUBSTITUTION */
 
-/***********************************/
-/*				   */
-/*	Command Substitution	   */
-/*				   */
-/***********************************/
-
-#define COMSUB_PIPEBUF	4096
-
-static char *
-optimize_cat_file (r, quoted, flags, flagp)
-     REDIRECT *r;
-     int quoted, flags, *flagp;
-{
-  char *ret;
-  int fd;
-
-  fd = open_redir_file (r, (char **)0);
-  if (fd < 0)
-    return &expand_param_error;
-
-  ret = read_comsub (fd, quoted, flags, flagp);
-  close (fd);
-
-  return ret;
-}
-
-static char *
-read_comsub (fd, quoted, flags, rflag)
-     int fd, quoted, flags;
-     int *rflag;
-{
-  char *istring, buf[COMSUB_PIPEBUF], *bufp;
-  int c, tflag, skip_ctlesc, skip_ctlnul;
-  int mb_cur_max;
-  size_t istring_index;
-  size_t istring_size;
-  ssize_t bufn;
-  int nullbyte;
-#if defined (HANDLE_MULTIBYTE)
-  mbstate_t ps;
-  wchar_t wc;
-  size_t mblen;
-  int i;
-#endif
-
-  istring = (char *)NULL;
-  istring_index = istring_size = bufn = tflag = 0;
-
-  skip_ctlesc = ifs_cmap[CTLESC];
-  skip_ctlnul = ifs_cmap[CTLNUL];
-
-  mb_cur_max = MB_CUR_MAX;
-  nullbyte = 0;
-
-  /* Read the output of the command through the pipe. */
-  while (1)
-    {
-      if (fd < 0)
-	break;
-      if (--bufn <= 0)
-	{
-	  bufn = zread (fd, buf, sizeof (buf));
-	  if (bufn <= 0) 
-	    break;
-	  bufp = buf;
-	}
-      c = *bufp++;
-
-      if (c == 0)
-	{
-#if 1
-	  if (nullbyte == 0)
-	    {
-	      internal_warning ("%s", _("command substitution: ignored null byte in input"));
-	      nullbyte = 1;
-	    }
-#endif
-	  continue;
-	}
-
-      /* Add the character to ISTRING, possibly after resizing it. */
-      RESIZE_MALLOCED_BUFFER (istring, istring_index, mb_cur_max+1, istring_size, 512);
-
-      /* This is essentially quote_string inline */
-      if ((quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) /* || c == CTLESC || c == CTLNUL */)
-	istring[istring_index++] = CTLESC;
-      else if ((flags & PF_ASSIGNRHS) && skip_ctlesc && c == CTLESC)
-	istring[istring_index++] = CTLESC;
-      /* Escape CTLESC and CTLNUL in the output to protect those characters
-	 from the rest of the word expansions (word splitting and globbing.)
-	 This is essentially quote_escapes inline. */
-      else if (skip_ctlesc == 0 && c == CTLESC)
-	istring[istring_index++] = CTLESC;
-      else if ((skip_ctlnul == 0 && c == CTLNUL) || (c == ' ' && (ifs_value && *ifs_value == 0)))
-	istring[istring_index++] = CTLESC;
-
-#if defined (HANDLE_MULTIBYTE)
-      if ((locale_utf8locale && (c & 0x80)) ||
-	  (locale_utf8locale == 0 && mb_cur_max > 1 && (unsigned char)c > 127))
-	{
-	  /* read a multibyte character from buf */
-	  /* punt on the hard case for now */
-	  memset (&ps, '\0', sizeof (mbstate_t));
-	  mblen = mbrtowc (&wc, bufp-1, bufn, &ps);
-	  if (MB_INVALIDCH (mblen) || mblen == 0 || mblen == 1)
-	    istring[istring_index++] = c;
-	  else
-	    {
-	      istring[istring_index++] = c;
-	      for (i = 0; i < mblen-1; i++)
-		istring[istring_index++] = *bufp++;
-	      bufn -= mblen - 1;
-	    }
-	  continue;
-	}
-#endif
-
-      istring[istring_index++] = c;
-    }
-
-  if (istring)
-    istring[istring_index] = '\0';
-
-  /* If we read no output, just return now and save ourselves some
-     trouble. */
-  if (istring_index == 0)
-    {
-      FREE (istring);
-      if (rflag)
-	*rflag = tflag;
-      return (char *)NULL;
-    }
-
-  /* Strip trailing newlines from the output of the command. */
-  if (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
-    {
-      while (istring_index > 0)
-	{
-	  if (istring[istring_index - 1] == '\n')
-	    {
-	      --istring_index;
-
-	      /* If the newline was quoted, remove the quoting char. */
-	      if (istring[istring_index - 1] == CTLESC)
-		--istring_index;
-	    }
-	  else
-	    break;
-	}
-      istring[istring_index] = '\0';
-    }
-  else
-    strip_trailing (istring, istring_index - 1, 1);
-
-  if (rflag)
-    *rflag = tflag;
-  return istring;
-}
-
-/* Perform command substitution on STRING.  This returns a WORD_DESC * with the
-   contained string possibly quoted. */
-WORD_DESC *
-command_substitute (string, quoted, flags)
-     char *string;
-     int quoted;
-     int flags;
-{
-  pid_t pid, old_pid, old_pipeline_pgrp, old_async_pid;
-  char *istring, *s;
-  int result, fildes[2], function_value, pflags, rc, tflag, fork_flags;
-  WORD_DESC *ret;
-  sigset_t set, oset;
-
-  istring = (char *)NULL;
-
-  /* Don't fork () if there is no need to.  In the case of no command to
-     run, just return NULL. */
-  for (s = string; s && *s && (shellblank (*s) || *s == '\n'); s++)
-    ;
-  if (s == 0 || *s == 0)
-    return ((WORD_DESC *)NULL);
-
-  if (*s == '<' && (s[1] != '<' && s[1] != '>' && s[1] != '&'))
-    {
-      COMMAND *cmd;
-
-      cmd = parse_string_to_command (string, 0);	/* XXX - flags */
-      if (cmd && can_optimize_cat_file (cmd))
-	{
-	  tflag = 0;
-	  istring = optimize_cat_file (cmd->value.Simple->redirects, quoted, flags, &tflag);
-	  if (istring == &expand_param_error)
-	    {
-	      last_command_exit_value = EXECUTION_FAILURE;
-	      istring = 0;
-	    }
-	  else
-	    last_command_exit_value = EXECUTION_SUCCESS;	/* compat */
-	  last_command_subst_pid = dollar_dollar_pid;
-
-	  dispose_command (cmd);	  
-	  ret = alloc_word_desc ();
-	  ret->word = istring;
-	  ret->flags = tflag;
-
-	  return ret;
-	}
-      dispose_command (cmd);
-    }
-
-  if (wordexp_only && read_but_dont_execute)
-    {
-      last_command_exit_value = EX_WEXPCOMSUB;
-      jump_to_top_level (EXITPROG);
-    }
-
-  /* We're making the assumption here that the command substitution will
-     eventually run a command from the file system.  Since we'll run
-     maybe_make_export_env in this subshell before executing that command,
-     the parent shell and any other shells it starts will have to remake
-     the environment.  If we make it before we fork, other shells won't
-     have to.  Don't bother if we have any temporary variable assignments,
-     though, because the export environment will be remade after this
-     command completes anyway, but do it if all the words to be expanded
-     are variable assignments. */
-  if (subst_assign_varlist == 0 || garglist == 0)
-    maybe_make_export_env ();	/* XXX */
-
-  /* Flags to pass to parse_and_execute() */
-  pflags = (interactive && sourcelevel == 0) ? SEVAL_RESETLINE : 0;
-
-  old_pid = last_made_pid;
-
-  /* Pipe the output of executing STRING into the current shell. */
-  if (pipe (fildes) < 0)
-    {
-      sys_error ("%s", _("cannot make pipe for command substitution"));
-      goto error_exit;
-    }
-
-#if defined (JOB_CONTROL)
-  old_pipeline_pgrp = pipeline_pgrp;
-  /* Don't reset the pipeline pgrp if we're already a subshell in a pipeline or
-     we've already forked to run a disk command (and are expanding redirections,
-     for example). */
-  if ((subshell_environment & (SUBSHELL_FORK|SUBSHELL_PIPE)) == 0)
-    pipeline_pgrp = shell_pgrp;
-  cleanup_the_pipeline ();
-#endif /* JOB_CONTROL */
-
-  old_async_pid = last_asynchronous_pid;
-  fork_flags = (subshell_environment&SUBSHELL_ASYNC) ? FORK_ASYNC : 0;
-  pid = make_child ((char *)NULL, fork_flags|FORK_NOTERM);
-  last_asynchronous_pid = old_async_pid;
-
-  if (pid == 0)
-    {
-      /* Reset the signal handlers in the child, but don't free the
-	 trap strings.  Set a flag noting that we have to free the
-	 trap strings if we run trap to change a signal disposition. */
-      reset_signal_handlers ();
-      if (ISINTERRUPT)
-	{
-	  kill (getpid (), SIGINT);
-	  CLRINTERRUPT;		/* if we're ignoring SIGINT somehow */
-	}	
-      QUIT;	/* catch any interrupts we got post-fork */
-      subshell_environment |= SUBSHELL_RESETTRAP;
-      subshell_environment &= ~SUBSHELL_IGNTRAP;
-    }
-
-#if defined (JOB_CONTROL)
-  /* XXX DO THIS ONLY IN PARENT ? XXX */
-  set_sigchld_handler ();
-  stop_making_children ();
-  if (pid != 0)
-    pipeline_pgrp = old_pipeline_pgrp;
-#else
-  stop_making_children ();
-#endif /* JOB_CONTROL */
-
-  if (pid < 0)
-    {
-      sys_error (_("cannot make child for command substitution"));
-    error_exit:
-
-      last_made_pid = old_pid;
-
-      FREE (istring);
-      close (fildes[0]);
-      close (fildes[1]);
-      return ((WORD_DESC *)NULL);
-    }
-
-  if (pid == 0)
-    {
-      /* The currently executing shell is not interactive. */
-      interactive = 0;
-
-#if defined (JOB_CONTROL)
-      /* Invariant: in child processes started to run command substitutions,
-	 pipeline_pgrp == shell_pgrp. Other parts of the shell assume this. */
-      if (pipeline_pgrp > 0 && pipeline_pgrp != shell_pgrp)
-	shell_pgrp = pipeline_pgrp;
-#endif
-
-      set_sigint_handler ();	/* XXX */
-
-      free_pushed_string_input ();
-
-      /* Discard  buffered stdio output before replacing the underlying file
-	 descriptor. */
-      fpurge (stdout);
-
-      if (dup2 (fildes[1], 1) < 0)
-	{
-	  sys_error ("%s", _("command_substitute: cannot duplicate pipe as fd 1"));
-	  exit (EXECUTION_FAILURE);
-	}
-
-      /* If standard output is closed in the parent shell
-	 (such as after `exec >&-'), file descriptor 1 will be
-	 the lowest available file descriptor, and end up in
-	 fildes[0].  This can happen for stdin and stderr as well,
-	 but stdout is more important -- it will cause no output
-	 to be generated from this command. */
-      if ((fildes[1] != fileno (stdin)) &&
-	  (fildes[1] != fileno (stdout)) &&
-	  (fildes[1] != fileno (stderr)))
-	close (fildes[1]);
-
-      if ((fildes[0] != fileno (stdin)) &&
-	  (fildes[0] != fileno (stdout)) &&
-	  (fildes[0] != fileno (stderr)))
-	close (fildes[0]);
-
-#ifdef __CYGWIN__
-      /* Let stdio know the fd may have changed from text to binary mode, and
-	 make sure to preserve stdout line buffering. */
-      freopen (NULL, "w", stdout);
-      sh_setlinebuf (stdout);
-#endif /* __CYGWIN__ */
-
-      /* This is a subshell environment. */
-      subshell_environment |= SUBSHELL_COMSUB;
-
-      /* Many shells do not appear to inherit the -v option for command
-	 substitutions. */
-      change_flag ('v', FLAG_OFF);
-
-      /* When inherit_errexit option is not enabled, command substitution does
-	 not inherit the -e flag.  It is enabled when Posix mode is enabled */
-      if (inherit_errexit == 0)
-        {
-          builtin_ignoring_errexit = 0;
-	  change_flag ('e', FLAG_OFF);
-        }
-      set_shellopts ();
-
-      /* If we are expanding a redirection, we can dispose of any temporary
-	 environment we received, since redirections are not supposed to have
-	 access to the temporary environment.  We will have to see whether this
-	 affects temporary environments supplied to `eval', but the temporary
-	 environment gets copied to builtin_env at some point. */
-      if (expanding_redir)
-	{
-	  flush_temporary_env ();
-	  expanding_redir = 0;
-	}
-
-      remove_quoted_escapes (string);
-
-      /* We want to expand aliases on this pass if we are not in posix mode
-	 for backwards compatibility. parse_and_execute() takes care of
-	 setting expand_aliases back to the global value when executing the
-	 parsed string. We only do this for $(...) command substitution,
-	 since that is what parse_comsub handles; `` comsubs are processed
-	 using parse.y:parse_matched_pair(). */
-      if (expand_aliases && (flags & PF_BACKQUOTE) == 0)
-        expand_aliases = posixly_correct == 0;
-
-      startup_state = 2;	/* see if we can avoid a fork */
-      parse_and_execute_level = 0;
-
-      /* Give command substitution a place to jump back to on failure,
-	 so we don't go back up to main (). */
-      result = setjmp_nosigs (top_level);
-
-      /* If we're running a command substitution inside a shell function,
-	 trap `return' so we don't return from the function in the subshell
-	 and go off to never-never land. */
-      if (result == 0 && return_catch_flag)
-	function_value = setjmp_nosigs (return_catch);
-      else
-	function_value = 0;
-
-      if (result == ERREXIT)
-	rc = last_command_exit_value;
-      else if (result == EXITPROG || result == EXITBLTIN)
-	rc = last_command_exit_value;
-      else if (result)
-	rc = EXECUTION_FAILURE;
-      else if (function_value)
-	rc = return_catch_value;
-      else
-	{
-	  subshell_level++;
-	  rc = parse_and_execute (string, "command substitution", pflags|SEVAL_NOHIST);
-	  /* leave subshell level intact for any exit trap */
-	}
-
-      last_command_exit_value = rc;
-      rc = run_exit_trap ();
-#if defined (PROCESS_SUBSTITUTION)
-      unlink_fifo_list ();
-#endif
-      exit (rc);
-    }
-  else
-    {
-      int dummyfd;
-
-#if defined (JOB_CONTROL) && defined (PGRP_PIPE)
-      close_pgrp_pipe ();
-#endif /* JOB_CONTROL && PGRP_PIPE */
-
-      close (fildes[1]);
-
-      begin_unwind_frame ("read-comsub");
-      dummyfd = fildes[0];
-      add_unwind_protect (close, dummyfd);
-
-      /* Block SIGINT while we're reading from the pipe. If the child
-	 process gets a SIGINT, it will either handle it or die, and the
-	 read will return. */
-      BLOCK_SIGNAL (SIGINT, set, oset);
-      tflag = 0;
-      istring = read_comsub (fildes[0], quoted, flags, &tflag);
-
-      close (fildes[0]);
-      discard_unwind_frame ("read-comsub");
-      UNBLOCK_SIGNAL (oset);
-
-      current_command_subst_pid = pid;
-      last_command_exit_value = wait_for (pid, JWAIT_NOTERM);
-      last_command_subst_pid = pid;
-      last_made_pid = old_pid;
-
-#if defined (JOB_CONTROL)
-      /* If last_command_exit_value > 128, then the substituted command
-	 was terminated by a signal.  If that signal was SIGINT, then send
-	 SIGINT to ourselves.  This will break out of loops, for instance. */
-      if (last_command_exit_value == (128 + SIGINT) && last_command_exit_signal == SIGINT)
-	kill (getpid (), SIGINT);
-#endif /* JOB_CONTROL */
-
-      ret = alloc_word_desc ();
-      ret->word = istring;
-      ret->flags = tflag;
-
-      return ret;
-    }
-}
 
 /********************************************************
  *							*
@@ -7227,8 +2502,7 @@ command_substitute (string, quoted, flags)
 #if defined (ARRAY_VARS)
 
 static arrayind_t
-array_length_reference (s)
-     char *s;
+array_length_reference (char *s)
 {
   int len;
   arrayind_t ind;
@@ -7308,9 +2582,7 @@ array_length_reference (s)
 #endif /* ARRAY_VARS */
 
 static int
-valid_brace_expansion_word (name, var_is_special)
-     char *name;
-     int var_is_special;
+valid_brace_expansion_word (const char *name, int var_is_special)
 {
   if (DIGIT (*name) && all_digits (name))
     return 1;
@@ -7327,10 +2599,7 @@ valid_brace_expansion_word (name, var_is_special)
 }
 
 static int
-chk_atstar (name, quoted, pflags, quoted_dollar_atp, contains_dollar_at)
-     char *name;
-     int quoted, pflags;
-     int *quoted_dollar_atp, *contains_dollar_at;
+chk_atstar (char *name, int quoted, int pflags, int *quoted_dollar_atp, int *contains_dollar_at)
 {
   char *temp1;
 
@@ -7393,10 +2662,7 @@ chk_atstar (name, quoted, pflags, quoted_dollar_atp, contains_dollar_at)
    the shell, e.g., "@", "$", "*", etc.  QUOTED, if non-zero, means that
    NAME was found inside of a double-quoted expression. */
 static WORD_DESC *
-parameter_brace_expand_word (name, var_is_special, quoted, pflags, estatep)
-     char *name;
-     int var_is_special, quoted, pflags;
-     array_eltstate_t *estatep;
+parameter_brace_expand_word (char *name, int var_is_special, int quoted, int pflags, array_eltstate_t *estatep)
 {
   WORD_DESC *ret;
   char *temp, *tt;
@@ -7579,9 +2845,7 @@ expand_arrayref:
 }
 
 static char *
-parameter_brace_find_indir (name, var_is_special, quoted, find_nameref)
-     char *name;
-     int var_is_special, quoted, find_nameref;
+parameter_brace_find_indir (char *name, int var_is_special, int quoted, int find_nameref)
 {
   char *temp, *t;
   WORD_DESC *w;
@@ -7625,10 +2889,7 @@ parameter_brace_find_indir (name, var_is_special, quoted, find_nameref)
 /* Expand an indirect reference to a variable: ${!NAME} expands to the
    value of the variable whose name is the value of NAME. */
 static WORD_DESC *
-parameter_brace_expand_indir (name, var_is_special, quoted, pflags, quoted_dollar_atp, contains_dollar_at)
-     char *name;
-     int var_is_special, quoted, pflags;
-     int *quoted_dollar_atp, *contains_dollar_at;
+parameter_brace_expand_indir (char *name, int var_is_special, int quoted, int pflags, int *quoted_dollar_atp, int *contains_dollar_at)
 {
   char *t;
   WORD_DESC *w;
@@ -7709,9 +2970,7 @@ parameter_brace_expand_indir (name, var_is_special, quoted, pflags, quoted_dolla
    "-", "+", or "=".  QUOTED is true if the entire brace expression occurs
    between double quotes. */
 static WORD_DESC *
-parameter_brace_expand_rhs (name, value, op, quoted, pflags, qdollaratp, hasdollarat)
-     char *name, *value;
-     int op, quoted, pflags, *qdollaratp, *hasdollarat;
+parameter_brace_expand_rhs (char *name, char *value, int op, int quoted, int pflags, int *qdollaratp, int *hasdollarat)
 {
   WORD_DESC *w;
   WORD_LIST *l, *tl;
@@ -7939,9 +3198,7 @@ parameter_brace_expand_rhs (name, value, op, quoted, pflags, qdollaratp, hasdoll
    used as the error message to print, otherwise a standard message is
    printed. */
 static void
-parameter_brace_expand_error (name, value, check_null)
-     char *name, *value;
-     int check_null;
+parameter_brace_expand_error (char *name, char *value, int check_null)
 {
   WORD_LIST *l;
   char *temp;
@@ -7969,8 +3226,7 @@ parameter_brace_expand_error (name, value, check_null)
 /* Return 1 if NAME is something for which parameter_brace_expand_length is
    OK to do. */
 static int
-valid_length_expression (name)
-     char *name;
+valid_length_expression (char *name)
 {
   return (name[1] == '\0' ||					/* ${#} */
 	  ((sh_syntaxtab[(unsigned char) name[1]] & CSPECVAR) && name[2] == '\0') ||  /* special param */
@@ -7984,8 +3240,7 @@ valid_length_expression (name)
 /* Handle the parameter brace expansion that requires us to return the
    length of a parameter. */
 static intmax_t
-parameter_brace_expand_length (name)
-     char *name;
+parameter_brace_expand_length (char *name)
 {
   char *t, *newname;
   intmax_t number, arg_index;
@@ -8089,9 +3344,7 @@ parameter_brace_expand_length (name)
 */
 
 static char *
-skiparith (substr, delim)
-     char *substr;
-     int delim;
+skiparith (char *substr, int delim)
 {
   int i;
   char delims[2];
@@ -8110,11 +3363,7 @@ skiparith (substr, delim)
    Return value is 1 if both values were OK, 0 if there was a problem
    with an invalid expression, or -1 if the values were out of range. */
 static int
-verify_substring_values (v, value, substr, vtype, e1p, e2p)
-     SHELL_VAR *v;
-     char *value, *substr;
-     int vtype;
-     intmax_t *e1p, *e2p;
+verify_substring_values (SHELL_VAR *v, char *value, char *substr, int vtype, intmax_t *e1p, intmax_t *e2p)
 {
   char *t, *temp1, *temp2;
   arrayind_t len;
@@ -8246,13 +3495,8 @@ verify_substring_values (v, value, substr, vtype, e1p, e2p)
    If this returns VT_VARIABLE, the caller assumes that CTLESC and CTLNUL
    characters in the value are quoted with CTLESC and takes appropriate
    steps.  For convenience, *VALP is set to the dequoted VALUE. */
-static int
-get_var_and_type (varname, value, estatep, quoted, flags, varp, valp)
-     char *varname, *value;
-     array_eltstate_t *estatep;
-     int quoted, flags;
-     SHELL_VAR **varp;
-     char **valp;
+int
+get_var_and_type (char *varname, char *value, array_eltstate_t *estatep, int quoted, int flags, SHELL_VAR **varp, char **valp)
 {
   int vtype, want_indir;
   char *temp, *vname;
@@ -8364,9 +3608,7 @@ get_var_and_type (varname, value, estatep, quoted, flags, varp, valp)
 /***********************************************************/
 
 static char *
-string_var_assignment (v, s)
-     SHELL_VAR *v;
-     char *s;
+string_var_assignment (SHELL_VAR *v, char *s)
 {
   char flags[MAX_ATTRIBUTES], *ret, *val;
   int i;
@@ -8389,9 +3631,7 @@ string_var_assignment (v, s)
 
 #if defined (ARRAY_VARS)
 static char *
-array_var_assignment (v, itype, quoted, atype)
-     SHELL_VAR *v;
-     int itype, quoted, atype;
+array_var_assignment (SHELL_VAR *v, int itype, int quoted, int atype)
 {
   char *ret, *val, flags[MAX_ATTRIBUTES];
   int i;
@@ -8436,10 +3676,7 @@ array_var_assignment (v, itype, quoted, atype)
 #endif
 
 static char *
-pos_params_assignment (list, itype, quoted)
-     WORD_LIST *list;
-     int itype;
-     int quoted;
+pos_params_assignment (WORD_LIST *list, int itype, int quoted)
 {
   char *temp, *ret;
 
@@ -8453,10 +3690,7 @@ pos_params_assignment (list, itype, quoted)
 }
 
 static char *
-string_transform (xc, v, s)
-     int xc;
-     SHELL_VAR *v;
-     char *s;
+string_transform (int xc, SHELL_VAR *v, char *s)
 {
   char *ret, flags[MAX_ATTRIBUTES], *t;
   int i;
@@ -8509,11 +3743,7 @@ string_transform (xc, v, s)
 }
 
 static char *
-list_transform (xc, v, list, itype, quoted)
-     int xc;
-     SHELL_VAR *v;
-     WORD_LIST *list;
-     int itype, quoted;
+list_transform (int xc, SHELL_VAR *v, WORD_LIST *list, int itype, int quoted)
 {
   WORD_LIST *new, *l;
   WORD_DESC *w;
@@ -8542,10 +3772,7 @@ list_transform (xc, v, list, itype, quoted)
 }
 
 static char *
-parameter_list_transform (xc, itype, quoted)
-     int xc;
-     int itype;
-     int quoted;
+parameter_list_transform (int xc, int itype, int quoted)
 {
   char *ret;
   WORD_LIST *list;
@@ -8563,11 +3790,7 @@ parameter_list_transform (xc, itype, quoted)
 
 #if defined (ARRAY_VARS)
 static char *
-array_transform (xc, var, starsub, quoted)
-     int xc;
-     SHELL_VAR *var;
-     int starsub;	/* so we can figure out how it's indexed */
-     int quoted;
+array_transform (int xc, SHELL_VAR *var, int starsub, int quoted)
 {
   ARRAY *a;
   HASH_TABLE *h;
@@ -8626,8 +3849,7 @@ array_transform (xc, var, starsub, quoted)
 #endif /* ARRAY_VARS */
 
 static int
-valid_parameter_transform (xform)
-     char *xform;
+valid_parameter_transform (char *xform)
 {
   if (xform[1])
     return 0;
@@ -8652,11 +3874,7 @@ valid_parameter_transform (xform)
 }
       
 static char *
-parameter_brace_transform (varname, value, estatep, xform, rtype, quoted, pflags, flags)
-     char *varname, *value;
-     array_eltstate_t *estatep;
-     char *xform;
-     int rtype, quoted, pflags, flags;
+parameter_brace_transform (char *varname, char *value, array_eltstate_t *estatep, char *xform, int rtype, int quoted, int pflags, int flags)
 {
   int vtype, xc, starsub;
   char *temp1, *val, *oname;
@@ -8755,9 +3973,7 @@ parameter_brace_transform (varname, value, estatep, xform, rtype, quoted, pflags
    multibyte character) positions that require calculation.
    Used by the ${param:offset[:length]} expansion. */
 static char *
-mb_substring (string, s, e)
-     char *string;
-     int s, e;
+mb_substring (char *string, int s, int e)
 {
   char *tt;
   int start, stop, i;
@@ -8785,11 +4001,7 @@ mb_substring (string, s, e)
    VARNAME.  If VARNAME is an array variable, use the array elements. */
 
 static char *
-parameter_brace_substring (varname, value, estatep, substr, quoted, pflags, flags)
-     char *varname, *value;
-     array_eltstate_t *estatep;
-     char *substr;
-     int quoted, pflags, flags;
+parameter_brace_substring (char *varname, char *value, array_eltstate_t *estatep, char *substr, int quoted, int pflags, int flags)
 {
   intmax_t e1, e2;
   int vtype, r, starsub;
@@ -8886,422 +4098,6 @@ parameter_brace_substring (varname, value, estatep, substr, quoted, pflags, flag
 
 /****************************************************************/
 /*								*/
-/* Functions to perform pattern substitution on variable values */
-/*								*/
-/****************************************************************/
-
-static int
-shouldexp_replacement (s)
-     char *s;
-{
-  size_t slen;
-  int sindex, c;
-  DECLARE_MBSTATE;
-
-  sindex = 0;
-  slen = STRLEN (s);
-  while (c = s[sindex])
-    {
-      if (c == '\\')
-	{
-	  sindex++;
-	  if (s[sindex] == 0)
-	    return 0;
-	  /* We want to remove this backslash because we treat it as special
-	     in this context. THIS ASSUMES THE STRING IS PROCESSED BY
-	     strcreplace() OR EQUIVALENT that handles removing backslashes
-	     preceding the special character. */
-	  if (s[sindex] == '&')
-	    return 1;
-	  if (s[sindex] == '\\')
-	    return 1;
-	}
-      else if (c == '&')
-	return 1;
-      ADVANCE_CHAR (s, slen, sindex);
-    }
-  return 0;
-}
-
-char *
-pat_subst (string, pat, rep, mflags)
-     char *string, *pat, *rep;
-     int mflags;
-{
-  char *ret, *s, *e, *str, *rstr, *mstr, *send;
-  int rptr, mtype, rxpand, mlen;
-  size_t rsize, l, replen, rslen;
-  DECLARE_MBSTATE;
-
-  if (string == 0)
-    return (savestring (""));
-
-  mtype = mflags & MATCH_TYPEMASK;
-  rxpand = mflags & MATCH_EXPREP;
-
-  /* Special cases:
-   * 	1.  A null pattern with mtype == MATCH_BEG means to prefix STRING
-   *	    with REP and return the result.
-   *	2.  A null pattern with mtype == MATCH_END means to append REP to
-   *	    STRING and return the result.
-   *	3.  A null STRING with a matching pattern means to append REP to
-   *	    STRING and return the result.
-   *
-   * These process `&' in the replacement string, like `sed' does when
-   * presented with a BRE of `^' or `$'.
-   */
-  if ((pat == 0 || *pat == 0) && (mtype == MATCH_BEG || mtype == MATCH_END))
-    {
-      rstr = (mflags & MATCH_EXPREP) ? strcreplace (rep, '&', "", 2) : rep;
-      rslen = STRLEN (rstr);
-      l = STRLEN (string);
-      ret = (char *)xmalloc (rslen + l + 2);
-      if (rslen == 0)
-	strcpy (ret, string);
-      else if (mtype == MATCH_BEG)
-	{
-	  strcpy (ret, rstr);
-	  strcpy (ret + rslen, string);
-	}
-      else
-	{
-	  strcpy (ret, string);
-	  strcpy (ret + l, rstr);
-	}
-      if (rstr != rep)
-	free (rstr);
-      return (ret);
-    }
-  else if (*string == 0 && (match_pattern (string, pat, mtype, &s, &e) != 0))
-    return (mflags & MATCH_EXPREP) ? strcreplace (rep, '&', "", 2)
-				   : (rep ? savestring (rep) : savestring (""));
-
-  ret = (char *)xmalloc (rsize = 64);
-  ret[0] = '\0';
-  send = string + strlen (string);
-
-  for (replen = STRLEN (rep), rptr = 0, str = string; *str;)
-    {
-      if (match_pattern (str, pat, mtype, &s, &e) == 0)
-	break;
-      l = s - str;
-
-      if (rep && rxpand)
-        {
-	  int x;
-	  mlen = e - s;
-	  mstr = xmalloc (mlen + 1);
-	  for (x = 0; x < mlen; x++)
-	    mstr[x] = s[x];
-	  mstr[mlen] = '\0';
-	  rstr = strcreplace (rep, '&', mstr, 2);
-	  free (mstr);
-	  rslen = strlen (rstr);
-        }
-      else
-	{
-	  rstr = rep;
-	  rslen = replen;
-	}
-        
-      RESIZE_MALLOCED_BUFFER (ret, rptr, (l + rslen), rsize, 64);
-
-      /* OK, now copy the leading unmatched portion of the string (from
-	 str to s) to ret starting at rptr (the current offset).  Then copy
-	 the replacement string at ret + rptr + (s - str).  Increment
-	 rptr (if necessary) and str and go on. */
-      if (l)
-	{
-	  strncpy (ret + rptr, str, l);
-	  rptr += l;
-	}
-      if (replen)
-	{
-	  strncpy (ret + rptr, rstr, rslen);
-	  rptr += rslen;
-	}
-      str = e;		/* e == end of match */
-
-      if (rstr != rep)
-	free (rstr);
-
-      if (((mflags & MATCH_GLOBREP) == 0) || mtype != MATCH_ANY)
-	break;
-
-      if (s == e)
-	{
-	  /* On a zero-length match, make sure we copy one character, since
-	     we increment one character to avoid infinite recursion. */
-	  char *p, *origp, *origs;
-	  size_t clen;
-
-	  RESIZE_MALLOCED_BUFFER (ret, rptr, locale_mb_cur_max, rsize, 64);
-#if defined (HANDLE_MULTIBYTE)
-	  p = origp = ret + rptr;
-	  origs = str;
-	  COPY_CHAR_P (p, str, send);
-	  rptr += p - origp;
-	  e += str - origs;
-#else
-	  ret[rptr++] = *str++;
-	  e++;		/* avoid infinite recursion on zero-length match */
-#endif
-	}
-    }
-
-  /* Now copy the unmatched portion of the input string */
-  if (str && *str)
-    {
-      l = send - str + 1;
-      RESIZE_MALLOCED_BUFFER (ret, rptr, l, rsize, 64);
-      strcpy (ret + rptr, str);
-    }
-  else
-    ret[rptr] = '\0';
-
-  return ret;
-}
-
-/* Do pattern match and replacement on the positional parameters. */
-static char *
-pos_params_pat_subst (string, pat, rep, mflags)
-     char *string, *pat, *rep;
-     int mflags;
-{
-  WORD_LIST *save, *params;
-  WORD_DESC *w;
-  char *ret;
-  int pchar, qflags, pflags;
-
-  save = params = list_rest_of_args ();
-  if (save == 0)
-    return ((char *)NULL);
-
-  for ( ; params; params = params->next)
-    {
-      ret = pat_subst (params->word->word, pat, rep, mflags);
-      w = alloc_word_desc ();
-      w->word = ret ? ret : savestring ("");
-      dispose_word (params->word);
-      params->word = w;
-    }
-
-  pchar = (mflags & MATCH_STARSUB) == MATCH_STARSUB ? '*' : '@';
-  qflags = (mflags & MATCH_QUOTED) == MATCH_QUOTED ? Q_DOUBLE_QUOTES : 0;
-  pflags = (mflags & MATCH_ASSIGNRHS) == MATCH_ASSIGNRHS ? PF_ASSIGNRHS : 0;
-
-  /* If we are expanding in a context where word splitting will not be
-     performed, treat as quoted. This changes how $* will be expanded. */
-  if (pchar == '*' && (mflags & MATCH_ASSIGNRHS) && expand_no_split_dollar_star && ifs_is_null)
-    qflags |= Q_DOUBLE_QUOTES;		/* Posix interp 888 */
-
-  ret = string_list_pos_params (pchar, save, qflags, pflags);
-  dispose_words (save);
-
-  return (ret);
-}
-
-/* Perform pattern substitution on VALUE, which is the expansion of
-   VARNAME.  PATSUB is an expression supplying the pattern to match
-   and the string to substitute.  QUOTED is a flags word containing
-   the type of quoting currently in effect. */
-static char *
-parameter_brace_patsub (varname, value, estatep, patsub, quoted, pflags, flags)
-     char *varname, *value;
-     array_eltstate_t *estatep;
-     char *patsub;
-     int quoted, pflags, flags;
-{
-  int vtype, mflags, starsub, delim;
-  char *val, *temp, *pat, *rep, *p, *lpatsub, *tt, *oname;
-  SHELL_VAR *v;
-
-  if (value == 0)
-    return ((char *)NULL);
-
-  oname = this_command_name;
-  this_command_name = varname;		/* error messages */
-
-  vtype = get_var_and_type (varname, value, estatep, quoted, flags, &v, &val);
-  if (vtype == -1)
-    {
-      this_command_name = oname;
-      return ((char *)NULL);
-    }
-
-  starsub = vtype & VT_STARSUB;
-  vtype &= ~VT_STARSUB;
-
-  mflags = 0;
-  /* PATSUB is never NULL when this is called. */
-  if (*patsub == '/')
-    {
-      mflags |= MATCH_GLOBREP;
-      patsub++;
-    }
-
-  /* Malloc this because expand_string_if_necessary or one of the expansion
-     functions in its call chain may free it on a substitution error. */
-  lpatsub = savestring (patsub);
-
-  if (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
-    mflags |= MATCH_QUOTED;
-
-  if (starsub)
-    mflags |= MATCH_STARSUB;
-
-  if (pflags & PF_ASSIGNRHS)
-    mflags |= MATCH_ASSIGNRHS;
-
-  /* If the pattern starts with a `/', make sure we skip over it when looking
-     for the replacement delimiter. */
-  delim = skip_to_delim (lpatsub, ((*patsub == '/') ? 1 : 0), "/", 0);
-  if (lpatsub[delim] == '/')
-    {
-      lpatsub[delim] = 0;
-      rep = lpatsub + delim + 1;
-    }
-  else
-    rep = (char *)NULL;
-
-  if (rep && *rep == '\0')
-    rep = (char *)NULL;
-
-  /* Perform the same expansions on the pattern as performed by the
-     pattern removal expansions. */
-  pat = getpattern (lpatsub, quoted, 1);
-
-  if (rep)
-    {
-      /* We want to perform quote removal on the expanded replacement even if
-	 the entire expansion is double-quoted because the parser and string
-	 extraction functions treated quotes in the replacement string as
-	 special.  THIS IS NOT BACKWARDS COMPATIBLE WITH BASH-4.2. */
-      if (shell_compatibility_level > 42 && patsub_replacement == 0)
-	rep = expand_string_if_necessary (rep, quoted & ~(Q_DOUBLE_QUOTES|Q_HERE_DOCUMENT), expand_string_unsplit);
-      else if (shell_compatibility_level > 42 && patsub_replacement)
-	rep = expand_string_for_patsub (rep, quoted & ~(Q_DOUBLE_QUOTES|Q_HERE_DOCUMENT));
-      /* This is the bash-4.2 code. */      
-      else if ((mflags & MATCH_QUOTED) == 0)
-	rep = expand_string_if_necessary (rep, quoted, expand_string_unsplit);
-      else
-	rep = expand_string_to_string_internal (rep, quoted, expand_string_unsplit);
-
-      /* Check whether or not to replace `&' in the replacement string after
-	 expanding it, since we want to treat backslashes quoting the `&'
-	 consistently. */
-      if (patsub_replacement && rep && *rep && shouldexp_replacement (rep))
-	mflags |= MATCH_EXPREP;
-
-    }
-
-  /* ksh93 doesn't allow the match specifier to be a part of the expanded
-     pattern.  This is an extension.  Make sure we don't anchor the pattern
-     at the beginning or end of the string if we're doing global replacement,
-     though. */
-  p = pat;
-  if (mflags & MATCH_GLOBREP)
-    mflags |= MATCH_ANY;
-  else if (pat && pat[0] == '#')
-    {
-      mflags |= MATCH_BEG;
-      p++;
-    }
-  else if (pat && pat[0] == '%')
-    {
-      mflags |= MATCH_END;
-      p++;
-    }
-  else
-    mflags |= MATCH_ANY;
-
-  /* OK, we now want to substitute REP for PAT in VAL.  If
-     flags & MATCH_GLOBREP is non-zero, the substitution is done
-     everywhere, otherwise only the first occurrence of PAT is
-     replaced.  The pattern matching code doesn't understand
-     CTLESC quoting CTLESC and CTLNUL so we use the dequoted variable
-     values passed in (VT_VARIABLE) so the pattern substitution
-     code works right.  We need to requote special chars after
-     we're done for VT_VARIABLE and VT_ARRAYMEMBER, and for the
-     other cases if QUOTED == 0, since the posparams and arrays
-     indexed by * or @ do special things when QUOTED != 0. */
-
-  switch (vtype)
-    {
-    case VT_VARIABLE:
-    case VT_ARRAYMEMBER:
-      temp = pat_subst (val, p, rep, mflags);
-      if (vtype == VT_VARIABLE)
-	FREE (val);
-      if (temp)
-	{
-	  tt = (mflags & MATCH_QUOTED) ? quote_string (temp) : quote_escapes (temp);
-	  free (temp);
-	  temp = tt;
-	}
-      break;
-    case VT_POSPARMS:
-      /* This does the right thing for the case where we are not performing
-	 word splitting. MATCH_STARSUB restricts it to ${* /foo/bar}, and
-	 pos_params_pat_subst/string_list_pos_params will do the right thing
-	 in turn for the case where ifs_is_null. Posix interp 888 */
-      if ((pflags & PF_NOSPLIT2) && (mflags & MATCH_STARSUB))
-        mflags |= MATCH_ASSIGNRHS;
-      temp = pos_params_pat_subst (val, p, rep, mflags);
-      if (temp && quoted == 0 && ifs_is_null)
-	{
-	  /* Posix interp 888 */
-	}
-      else if (temp && quoted == 0 && (pflags & PF_ASSIGNRHS))
-	{
-	  /* Posix interp 888 */
-	}
-      else if (temp && (mflags & MATCH_QUOTED) == 0)
-	{
-	  tt = quote_escapes (temp);
-	  free (temp);
-	  temp = tt;
-	}
-      break;
-#if defined (ARRAY_VARS)
-    case VT_ARRAYVAR:
-      /* If we are expanding in a context where word splitting will not be
-	 performed, treat as quoted.  This changes how ${A[*]} will be
-	 expanded to make it identical to $*. */
-      if ((mflags & MATCH_STARSUB) && (mflags & MATCH_ASSIGNRHS) && ifs_is_null)
-	mflags |= MATCH_QUOTED;		/* Posix interp 888 */
-
-      /* these eventually call string_list_pos_params */
-      if (assoc_p (v))
-	temp = assoc_patsub (assoc_cell (v), p, rep, mflags);
-      else
-	temp = array_patsub (array_cell (v), p, rep, mflags);
-
-      if (temp && quoted == 0 && ifs_is_null)
-	{
-	  /* Posix interp 888 */
-	}
-      else if (temp && (mflags & MATCH_QUOTED) == 0)
-	{
-	  tt = quote_escapes (temp);
-	  free (temp);
-	  temp = tt;
-	}
-      break;
-#endif
-    }
-
-  FREE (pat);
-  FREE (rep);
-  free (lpatsub);
-
-  this_command_name = oname;
-
-  return temp;
-}
-
-/****************************************************************/
-/*								*/
 /*   Functions to perform case modification on variable values  */
 /*								*/
 /****************************************************************/
@@ -9309,10 +4105,7 @@ parameter_brace_patsub (varname, value, estatep, patsub, quoted, pflags, flags)
 /* Do case modification on the positional parameters. */
 
 static char *
-pos_params_modcase (string, pat, modop, mflags)
-     char *string, *pat;
-     int modop;
-     int mflags;
+pos_params_modcase (char *string, char *pat, int modop, int mflags)
 {
   WORD_LIST *save, *params;
   WORD_DESC *w;
@@ -9352,12 +4145,7 @@ pos_params_modcase (string, pat, modop, mflags)
    to perform.  QUOTED is a flags word containing the type of quoting
    currently in effect. */
 static char *
-parameter_brace_casemod (varname, value, estatep, modspec, patspec, quoted, pflags, flags)
-     char *varname, *value;
-     array_eltstate_t *estatep;
-     int modspec;
-     char *patspec;
-     int quoted, pflags, flags;
+parameter_brace_casemod (char *varname, char *value, array_eltstate_t *estatep, int modspec, char *patspec, int quoted, int pflags, int flags)
 {
   int vtype, starsub, modop, mflags, x;
   char *val, *temp, *pat, *p, *lpat, *tt, *oname;
@@ -9484,9 +4272,7 @@ parameter_brace_casemod (varname, value, estatep, modspec, patspec, quoted, pfla
    means that this must not be an arithmetic expression, though the parser
    will not accept it without a balanced total number of parens. */
 static int
-chk_arithsub (s, len)
-     const char *s;
-     int len;
+chk_arithsub (const char *s, int len)
 {
   int i, count;
   DECLARE_MBSTATE;
@@ -9534,11 +4320,303 @@ chk_arithsub (s, len)
 /*								*/
 /****************************************************************/
 
+/* ------------------------------------------------------------------ */
+/* pbe_dispatch_operation -- dispatch the operation part of ${...}     */
+/*   Handles substring, patsub, casemod, transforms, pattern removal, */
+/*   and null/unset operators.  Returns a WORD_DESC * for early-return */
+/*   cases.  When the result is the sentinel `&expand_param_error`,    */
+/*   the caller should fall through to common cleanup code.  The       */
+/*   helper updates *tempp, *retp, *tflagp, and *quotedp as needed.   */
+/* ------------------------------------------------------------------ */
+#define PBE_DISPATCH_FALLTHROUGH (&expand_param_error) /* reused sentinel */
+
+static WORD_DESC *
+pbe_dispatch_operation (char *string, char *name, char **tempp, char *value,
+			array_eltstate_t *esp, int c, int *quotedp, int pflags,
+			int *quoted_dollar_atp, int *contains_dollar_at,
+			int want_substring, int want_patsub, int want_casemod,
+			int modspec, int var_is_set, int var_is_null,
+			int var_is_special, int check_nullness,
+			int tflag_in, int *tflagp, WORD_DESC **retp)
+{
+  char *temp = *tempp;
+  char *temp1;
+  WORD_DESC *ret = *retp;
+  int quoted = *quotedp;
+  int tflag = tflag_in;
+
+  /* If this is a substring spec, process it and add the result. */
+  if (want_substring)
+    {
+      temp1 = parameter_brace_substring (name, temp, esp, value, quoted, pflags, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
+      FREE (value);
+      FREE (temp);
+#if defined (ARRAY_VARS)
+      flush_eltstate (esp);
+#endif
+
+      if (temp1 == &expand_param_error || temp1 == &expand_param_fatal)
+        {
+          FREE (name);
+	  return (temp1 == &expand_param_error ? &expand_wdesc_error : &expand_wdesc_fatal);
+        }
+
+      ret = alloc_word_desc ();
+      ret->word = temp1;
+      if (temp1 &&
+          (quoted_dollar_atp == 0 || *quoted_dollar_atp == 0) &&
+	  QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
+	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
+      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 &&
+		(pflags & PF_ASSIGNRHS))
+	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
+      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
+	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
+
+      FREE (name);
+      return ret;
+    }
+  else if (want_patsub)
+    {
+      temp1 = parameter_brace_patsub (name, temp, esp, value, quoted, pflags, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
+      FREE (value);
+      FREE (temp);
+#if defined (ARRAY_VARS)
+      flush_eltstate (esp);
+#endif
+
+      if (temp1 == &expand_param_error || temp1 == &expand_param_fatal)
+        {
+          FREE (name);
+	  return (temp1 == &expand_param_error ? &expand_wdesc_error : &expand_wdesc_fatal);
+        }
+
+      ret = alloc_word_desc ();
+      ret->word = temp1;
+      if (temp1 &&
+          (quoted_dollar_atp == 0 || *quoted_dollar_atp == 0) &&
+	  QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
+	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
+      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
+	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
+
+      FREE (name);
+      return ret;
+    }
+#if defined (CASEMOD_EXPANSIONS)
+  else if (want_casemod)
+    {
+      temp1 = parameter_brace_casemod (name, temp, esp, modspec, value, quoted, pflags, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
+      FREE (value);
+      FREE (temp);
+#if defined (ARRAY_VARS)
+      flush_eltstate (esp);
+#endif
+
+      if (temp1 == &expand_param_error || temp1 == &expand_param_fatal)
+        {
+          FREE (name);
+	  return (temp1 == &expand_param_error ? &expand_wdesc_error : &expand_wdesc_fatal);
+        }
+
+      ret = alloc_word_desc ();
+      ret->word = temp1;
+      if (temp1 &&
+          (quoted_dollar_atp == 0 || *quoted_dollar_atp == 0) &&
+	  QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
+	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
+      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
+	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
+
+      FREE (name);
+      return ret;
+    }
+#endif
+
+  /* Do the right thing based on which character ended the variable name. */
+  switch (c)
+    {
+    default:
+    case '\0':
+      set_exit_status (EXECUTION_FAILURE);
+      report_error (_("%s: bad substitution"), string ? string : "??");
+      FREE (value);
+      FREE (temp);
+      free (name);
+#if defined (ARRAY_VARS)
+      flush_eltstate (esp);
+#endif
+      if (shell_compatibility_level <= 43)
+	return &expand_wdesc_error;
+      else
+	return ((posixly_correct && interactive_shell == 0) ? &expand_wdesc_fatal : &expand_wdesc_error);
+
+    case RBRACE:
+      break;
+
+    case '@':
+      temp1 = parameter_brace_transform (name, temp, esp, value, c, quoted, pflags, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
+      free (temp);
+      free (value);
+#if defined (ARRAY_VARS)
+      flush_eltstate (esp);
+#endif
+
+      if (temp1 == &expand_param_error || temp1 == &expand_param_fatal)
+	{
+	  free (name);
+	  set_exit_status (EXECUTION_FAILURE);
+	  report_error (_("%s: bad substitution"), string ? string : "??");
+	  return (temp1 == &expand_param_error ? &expand_wdesc_error : &expand_wdesc_fatal);
+	}
+
+      ret = alloc_word_desc ();
+      ret->word = temp1;
+      if (temp1 && QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
+	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
+      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
+	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
+
+      free (name);
+      return ret;
+
+    case '#':	/* ${param#[#]pattern} */
+    case '%':	/* ${param%[%]pattern} */
+      if (value == 0 || *value == '\0' || temp == 0 || *temp == '\0')
+	{
+	  FREE (value);
+	  break;
+	}
+      temp1 = parameter_brace_remove_pattern (name, temp, esp, value, c, quoted, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
+      free (temp);
+      free (value);
+#if defined (ARRAY_VARS)
+      flush_eltstate (esp);
+#endif
+
+      ret = alloc_word_desc ();
+      ret->word = temp1;
+      if (temp1 && QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
+	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
+      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
+	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
+
+      free (name);
+      return ret;
+
+    case '-':
+    case '=':
+    case '?':
+    case '+':
+      if (var_is_set && var_is_null == 0)
+	{
+	  /* If the operator is `+', we don't want the value of the named
+	     variable for anything, just the value of the right hand side. */
+	  if (c == '+')
+	    {
+	      /* XXX -- if we're double-quoted and the named variable is "$@",
+			we want to turn off any special handling of "$@" --
+			we're not using it, so whatever is on the rhs applies. */
+	      if ((quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) && quoted_dollar_atp)
+		*quoted_dollar_atp = 0;
+	      if (contains_dollar_at)
+		*contains_dollar_at = 0;
+
+	      FREE (temp);
+	      if (value)
+		{
+		  /* From Posix discussion on austin-group list.  Issue 221
+		     requires that backslashes escaping `}' inside
+		     double-quoted ${...} be removed. */
+		  if (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
+		    quoted |= Q_DOLBRACE;
+		  ret = parameter_brace_expand_rhs (name, value, c,
+						    quoted,
+						    pflags,
+						    quoted_dollar_atp,
+						    contains_dollar_at);
+		  /* XXX - fix up later, esp. noting presence of
+			   W_HASQUOTEDNULL in ret->flags */
+		  free (value);
+		}
+	      else
+		temp = (char *)NULL;
+	    }
+	  else
+	    {
+	      FREE (value);
+	    }
+	  /* Otherwise do nothing; just use the value in TEMP. */
+	}
+      else	/* VAR not set or VAR is NULL. */
+	{
+	  /* If we're freeing a quoted null here, we need to remember we saw
+	     it so we can restore it later if needed, or the caller can note it.
+	     The check against `+' doesn't really matter, since the other cases
+	     don't use or return TFLAG, but it's good for clarity. */
+	  if (c == '+' && temp && QUOTED_NULL (temp) &&
+	      (quoted & (Q_DOUBLE_QUOTES|Q_HERE_DOCUMENT)))
+	    tflag |= W_HASQUOTEDNULL;
+
+	  FREE (temp);
+	  temp = (char *)NULL;
+	  if (c == '=' && var_is_special)
+	    {
+	      set_exit_status (EXECUTION_FAILURE);
+	      report_error (_("$%s: cannot assign in this way"), name);
+	      free (name);
+	      free (value);
+#if defined (ARRAY_VARS)
+	      flush_eltstate (esp);
+#endif
+	      return &expand_wdesc_error;
+	    }
+	  else if (c == '?')
+	    {
+	      parameter_brace_expand_error (name, value, check_nullness);
+#if defined (ARRAY_VARS)
+	      flush_eltstate (esp);
+#endif
+	      return (interactive_shell ? &expand_wdesc_error : &expand_wdesc_fatal);
+	    }
+	  else if (c != '+')
+	    {
+	      /* XXX -- if we're double-quoted and the named variable is "$@",
+			we want to turn off any special handling of "$@" --
+			we're not using it, so whatever is on the rhs applies. */
+	      if ((quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) && quoted_dollar_atp)
+		*quoted_dollar_atp = 0;
+	      if (contains_dollar_at)
+		*contains_dollar_at = 0;
+
+	      /* From Posix discussion on austin-group list.  Issue 221 requires
+		 that backslashes escaping `}' inside double-quoted ${...} be
+		 removed. */
+	      if (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
+		quoted |= Q_DOLBRACE;
+	      ret = parameter_brace_expand_rhs (name, value, c, quoted, pflags,
+						quoted_dollar_atp,
+						contains_dollar_at);
+	      /* XXX - fix up later, esp. noting presence of
+		       W_HASQUOTEDNULL in tdesc->flags */
+	    }
+	  free (value);
+	}
+
+      break;
+    }
+
+  /* Signal the caller to use the common cleanup path. */
+  *tempp = temp;
+  *retp = ret;
+  *tflagp = tflag;
+  *quotedp = quoted;
+  return PBE_DISPATCH_FALLTHROUGH;
+}
+
 /* ${[#][!]name[[:][^[^]][,[,]]#[#]%[%]-=?+[word][:e1[:e2]]]} */
 static WORD_DESC *
-parameter_brace_expand (string, indexp, quoted, pflags, quoted_dollar_atp, contains_dollar_at)
-     char *string;
-     int *indexp, quoted, pflags, *quoted_dollar_atp, *contains_dollar_at;
+parameter_brace_expand (char *string, int *indexp, int quoted, int pflags, int *quoted_dollar_atp, int *contains_dollar_at)
 {
   int check_nullness, var_is_set, var_is_null, var_is_special;
   int want_substring, want_indir, want_patsub, want_casemod, want_attributes;
@@ -9936,106 +5014,25 @@ parameter_brace_expand (string, indexp, quoted, pflags, quoted_dollar_atp, conta
 	}
     }
     
-  /* If this is a substring spec, process it and add the result. */
-  if (want_substring)
+  /* Dispatch the operation (substring, patsub, casemod, null/unset, etc.) */
+  {
+    WORD_DESC *dispatch_result;
+
+    dispatch_result = pbe_dispatch_operation (string, name, &temp, value,
+					     &es, c, &quoted, pflags,
+					     quoted_dollar_atp, contains_dollar_at,
+					     want_substring, want_patsub, want_casemod,
+					     modspec, var_is_set, var_is_null,
+					     var_is_special, check_nullness,
+					     tflag, &tflag, &ret);
+    if (dispatch_result != PBE_DISPATCH_FALLTHROUGH)
+      return dispatch_result;
+  }
+
+  /* The bad_substitution label must remain here because it is the target
+     of goto from extract_dollar_brace_string error handling above. */
+  if (0)
     {
-      temp1 = parameter_brace_substring (name, temp, &es, value, quoted, pflags, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
-      FREE (value);
-      FREE (temp);
-#if defined (ARRAY_VARS)
-      flush_eltstate (&es);
-#endif
-
-      if (temp1 == &expand_param_error || temp1 == &expand_param_fatal)
-        {
-          FREE (name);
-	  return (temp1 == &expand_param_error ? &expand_wdesc_error : &expand_wdesc_fatal);
-        }
-
-      ret = alloc_word_desc ();
-      ret->word = temp1;
-      /* We test quoted_dollar_atp because we want variants with double-quoted
-	 "$@" to take a different code path. In fact, we make sure at the end
-	 of expand_word_internal that we're only looking at these flags if
-	 quoted_dollar_at == 0. */
-      if (temp1 &&
-          (quoted_dollar_atp == 0 || *quoted_dollar_atp == 0) &&
-	  QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
-	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
-      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 &&
-		(pflags & PF_ASSIGNRHS))
-	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */	
-      /* Special handling for $* when unquoted and $IFS is null. Posix interp 888 */
-      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
-	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
-
-      FREE (name);
-      return ret;
-    }
-  else if (want_patsub)
-    {
-      temp1 = parameter_brace_patsub (name, temp, &es, value, quoted, pflags, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
-      FREE (value);
-      FREE (temp);
-#if defined (ARRAY_VARS)
-      flush_eltstate (&es);
-#endif
-
-      if (temp1 == &expand_param_error || temp1 == &expand_param_fatal)
-        {
-          FREE (name);
-	  return (temp1 == &expand_param_error ? &expand_wdesc_error : &expand_wdesc_fatal);
-        }
-
-      ret = alloc_word_desc ();
-      ret->word = temp1;
-      if (temp1 && 
-          (quoted_dollar_atp == 0 || *quoted_dollar_atp == 0) &&
-	  QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
-	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
-      /* Special handling for $* when unquoted and $IFS is null. Posix interp 888 */
-      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
-	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
-
-      FREE (name);
-      return ret;
-    }
-#if defined (CASEMOD_EXPANSIONS)
-  else if (want_casemod)
-    {
-      temp1 = parameter_brace_casemod (name, temp, &es, modspec, value, quoted, pflags, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
-      FREE (value);
-      FREE (temp);
-#if defined (ARRAY_VARS)
-      flush_eltstate (&es);
-#endif
-
-      if (temp1 == &expand_param_error || temp1 == &expand_param_fatal)
-        {
-          FREE (name);
-	  return (temp1 == &expand_param_error ? &expand_wdesc_error : &expand_wdesc_fatal);
-        }
-
-      ret = alloc_word_desc ();
-      ret->word = temp1;
-      if (temp1 &&
-          (quoted_dollar_atp == 0 || *quoted_dollar_atp == 0) &&
-	  QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
-	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
-      /* Special handling for $* when unquoted and $IFS is null. Posix interp 888 */
-      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
-	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
-
-      FREE (name);
-      return ret;
-    }
-#endif
-
-  /* Do the right thing based on which character ended the variable name. */
-  switch (c)
-    {
-    default:
-    case '\0':
 bad_substitution:
       set_exit_status (EXECUTION_FAILURE);
       report_error (_("%s: bad substitution"), string ? string : "??");
@@ -10049,163 +5046,8 @@ bad_substitution:
 	return &expand_wdesc_error;
       else
 	return ((posixly_correct && interactive_shell == 0) ? &expand_wdesc_fatal : &expand_wdesc_error);
-
-    case RBRACE:
-      break;
-
-    case '@':
-      temp1 = parameter_brace_transform (name, temp, &es, value, c, quoted, pflags, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
-      free (temp);
-      free (value);
-#if defined (ARRAY_VARS)
-      flush_eltstate (&es);
-#endif
-
-      if (temp1 == &expand_param_error || temp1 == &expand_param_fatal)
-	{
-	  free (name);
-	  set_exit_status (EXECUTION_FAILURE);
-	  report_error (_("%s: bad substitution"), string ? string : "??");
-	  return (temp1 == &expand_param_error ? &expand_wdesc_error : &expand_wdesc_fatal);
-	}
-
-      ret = alloc_word_desc ();
-      ret->word = temp1;
-      if (temp1 && QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
-	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
-      /* Special handling for $* when unquoted and $IFS is null. Posix interp 888 */
-      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
-	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
-
-      free (name);
-      return ret;
-
-    case '#':	/* ${param#[#]pattern} */
-    case '%':	/* ${param%[%]pattern} */
-      if (value == 0 || *value == '\0' || temp == 0 || *temp == '\0')
-	{
-	  FREE (value);
-	  break;
-	}
-      temp1 = parameter_brace_remove_pattern (name, temp, &es, value, c, quoted, (tflag & W_ARRAYIND) ? AV_USEIND : 0);
-      free (temp);
-      free (value);
-#if defined (ARRAY_VARS)
-      flush_eltstate (&es);
-#endif
-
-      ret = alloc_word_desc ();
-      ret->word = temp1;
-      if (temp1 && QUOTED_NULL (temp1) && (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)))
-	ret->flags |= W_QUOTED|W_HASQUOTEDNULL;
-      /* Special handling for $* when unquoted and $IFS is null. Posix interp 888 */
-      else if (temp1 && (name[0] == '*' && name[1] == 0) && quoted == 0 && ifs_is_null)
-	ret->flags |= W_SPLITSPACE;	/* Posix interp 888 */
-
-      free (name);
-      return ret;
-
-    case '-':
-    case '=':
-    case '?':
-    case '+':
-      if (var_is_set && var_is_null == 0)
-	{
-	  /* If the operator is `+', we don't want the value of the named
-	     variable for anything, just the value of the right hand side. */
-	  if (c == '+')
-	    {
-	      /* XXX -- if we're double-quoted and the named variable is "$@",
-			we want to turn off any special handling of "$@" --
-			we're not using it, so whatever is on the rhs applies. */
-	      if ((quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) && quoted_dollar_atp)
-		*quoted_dollar_atp = 0;
-	      if (contains_dollar_at)
-		*contains_dollar_at = 0;
-
-	      FREE (temp);
-	      if (value)
-		{
-		  /* From Posix discussion on austin-group list.  Issue 221
-		     requires that backslashes escaping `}' inside
-		     double-quoted ${...} be removed. */
-		  if (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
-		    quoted |= Q_DOLBRACE;
-		  ret = parameter_brace_expand_rhs (name, value, c,
-						    quoted,
-						    pflags,
-						    quoted_dollar_atp,
-						    contains_dollar_at);
-		  /* XXX - fix up later, esp. noting presence of
-			   W_HASQUOTEDNULL in ret->flags */
-		  free (value);
-		}
-	      else
-		temp = (char *)NULL;
-	    }
-	  else
-	    {
-	      FREE (value);
-	    }
-	  /* Otherwise do nothing; just use the value in TEMP. */
-	}
-      else	/* VAR not set or VAR is NULL. */
-	{
-	  /* If we're freeing a quoted null here, we need to remember we saw
-	     it so we can restore it later if needed, or the caller can note it.
-	     The check against `+' doesn't really matter, since the other cases
-	     don't use or return TFLAG, but it's good for clarity. */
-	  if (c == '+' && temp && QUOTED_NULL (temp) &&
-	      (quoted & (Q_DOUBLE_QUOTES|Q_HERE_DOCUMENT)))
-	    tflag |= W_HASQUOTEDNULL;
-
-	  FREE (temp);
-	  temp = (char *)NULL;
-	  if (c == '=' && var_is_special)
-	    {
-	      set_exit_status (EXECUTION_FAILURE);
-	      report_error (_("$%s: cannot assign in this way"), name);
-	      free (name);
-	      free (value);
-#if defined (ARRAY_VARS)
-	      flush_eltstate (&es);
-#endif
-	      return &expand_wdesc_error;
-	    }
-	  else if (c == '?')
-	    {
-	      parameter_brace_expand_error (name, value, check_nullness);
-#if defined (ARRAY_VARS)
-	      flush_eltstate (&es);
-#endif
-	      return (interactive_shell ? &expand_wdesc_error : &expand_wdesc_fatal);
-	    }
-	  else if (c != '+')
-	    {
-	      /* XXX -- if we're double-quoted and the named variable is "$@",
-			we want to turn off any special handling of "$@" --
-			we're not using it, so whatever is on the rhs applies. */
-	      if ((quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES)) && quoted_dollar_atp)
-		*quoted_dollar_atp = 0;
-	      if (contains_dollar_at)
-		*contains_dollar_at = 0;
-
-	      /* From Posix discussion on austin-group list.  Issue 221 requires
-		 that backslashes escaping `}' inside double-quoted ${...} be
-		 removed. */
-	      if (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
-		quoted |= Q_DOLBRACE;
-	      ret = parameter_brace_expand_rhs (name, value, c, quoted, pflags,
-						quoted_dollar_atp,
-						contains_dollar_at);
-	      /* XXX - fix up later, esp. noting presence of
-		       W_HASQUOTEDNULL in tdesc->flags */
-	    }
-	  free (value);
-	}
-
-      break;
     }
+
   free (name);
 #if defined (ARRAY_VARS)
   flush_eltstate (&es);
@@ -10787,9 +5629,7 @@ static char abstab[256] = { '\1' };
 
 /* Run an array subscript through the appropriate word expansions. */
 char *
-expand_subscript_string (string, quoted)
-     char *string;
-     int quoted;
+expand_subscript_string (char *string, int quoted)
 {
   WORD_DESC td;
   WORD_LIST *tlist;
@@ -10829,10 +5669,7 @@ expand_subscript_string (string, quoted)
    only expand it once, we quote the characters that would start another
    expansion and the bracket characters that are special to array subscripts. */
 static char *
-expand_array_subscript (string, sindex, quoted, flags)
-     char *string;
-     int *sindex;
-     int quoted, flags;
+expand_array_subscript (char *string, int *sindex, int quoted, int flags)
 {
   char *ret, *exp, *t;
   size_t slen;
@@ -10919,17 +5756,538 @@ invalidate_cached_quoted_dollar_at ()
    This only does word splitting in the case of $@ expansion.  In that
    case, we split on ' '. */
 
-/* Values for the local variable quoted_state. */
-#define UNQUOTED	 0
-#define PARTIALLY_QUOTED 1
-#define WHOLLY_QUOTED    2
+/* ======================================================================
+   Helper types and functions for expand_word_internal decomposition.
+   These helpers extract major code blocks from the main function while
+   preserving exact behavior.  Each helper operates on a shared context
+   struct and returns an action enum that the caller maps to the
+   appropriate goto label.
+   ====================================================================== */
+
+/* Return values from ewi_* helpers, mapped to goto labels in the caller. */
+enum ewi_action {
+  EWI_ADD_STRING,		/* goto add_string */
+  EWI_ADD_CHARACTER,		/* goto add_character */
+  EWI_ADD_QUOTED_STRING,	/* goto add_quoted_string */
+  EWI_BREAK,			/* break from switch */
+  EWI_CONTINUE,			/* continue the for loop */
+  EWI_RETURN			/* early return -- result in ctx->list */
+};
+
+/* Shared mutable state for expand_word_internal and its helpers. */
+struct ewi_context
+{
+  /* The intermediate string that we build while expanding. */
+  char *istring;
+  size_t istring_size;
+  size_t istring_index;
+
+  /* Temporary string storage. */
+  char *temp;
+
+  /* The text of the word being expanded and its size/index. */
+  char *string;
+  size_t string_size;
+  int sindex;
+
+  /* Current character. */
+  unsigned char c;
+
+  /* For calls to string_extract_xxx. */
+  int t_index;
+
+  /* State flags. */
+  int quoted_dollar_at;
+  int quoted_state;
+  int had_quoted_null;
+  int has_quoted_ifs;
+  int has_dollar_at;
+  int temp_has_dollar_at;
+  int split_on_spaces;
+  int local_expanded;
+  int tflag;
+  int pflags;
+
+  /* Word list results. */
+  WORD_LIST *list;
+  WORD_DESC *tword;
+
+  /* Function parameters (non-owned pointers). */
+  WORD_DESC *word;
+  int quoted;
+  int *contains_dollar_at;
+  int *expanded_something;
+};
+
+/* Populate an ewi_context from the local variables of expand_word_internal.
+   This macro is used before calling any ewi_* helper function. */
+#define EWI_CTX_SAVE(ctx) do { \
+  (ctx).istring = istring; \
+  (ctx).istring_size = istring_size; \
+  (ctx).istring_index = istring_index; \
+  (ctx).temp = temp; \
+  (ctx).string = string; \
+  (ctx).string_size = string_size; \
+  (ctx).sindex = sindex; \
+  (ctx).c = c; \
+  (ctx).t_index = t_index; \
+  (ctx).quoted_dollar_at = quoted_dollar_at; \
+  (ctx).quoted_state = quoted_state; \
+  (ctx).had_quoted_null = had_quoted_null; \
+  (ctx).has_quoted_ifs = has_quoted_ifs; \
+  (ctx).has_dollar_at = has_dollar_at; \
+  (ctx).temp_has_dollar_at = temp_has_dollar_at; \
+  (ctx).split_on_spaces = split_on_spaces; \
+  (ctx).local_expanded = local_expanded; \
+  (ctx).tflag = tflag; \
+  (ctx).pflags = pflags; \
+  (ctx).tword = tword; \
+  (ctx).word = word; \
+  (ctx).quoted = quoted; \
+  (ctx).contains_dollar_at = contains_dollar_at; \
+  (ctx).expanded_something = expanded_something; \
+} while (0)
+
+/* Restore local variables from an ewi_context after calling an ewi_* helper. */
+#define EWI_CTX_RESTORE(ctx) do { \
+  istring = (ctx).istring; \
+  istring_size = (ctx).istring_size; \
+  istring_index = (ctx).istring_index; \
+  temp = (ctx).temp; \
+  string = (ctx).string; \
+  string_size = (ctx).string_size; \
+  sindex = (ctx).sindex; \
+  c = (ctx).c; \
+  t_index = (ctx).t_index; \
+  quoted_dollar_at = (ctx).quoted_dollar_at; \
+  quoted_state = (ctx).quoted_state; \
+  had_quoted_null = (ctx).had_quoted_null; \
+  has_quoted_ifs = (ctx).has_quoted_ifs; \
+  has_dollar_at = (ctx).has_dollar_at; \
+  temp_has_dollar_at = (ctx).temp_has_dollar_at; \
+  split_on_spaces = (ctx).split_on_spaces; \
+  local_expanded = (ctx).local_expanded; \
+  tflag = (ctx).tflag; \
+  pflags = (ctx).pflags; \
+  tword = (ctx).tword; \
+} while (0)
+
+/* ------------------------------------------------------------------ */
+/* ewi_handle_dollar -- handle `case '$':` dispatch (param expansion) */
+/* ------------------------------------------------------------------ */
+static enum ewi_action
+ewi_handle_dollar (struct ewi_context *ctx)
+{
+  if (ctx->expanded_something)
+    *ctx->expanded_something = 1;
+  ctx->local_expanded = 1;
+
+  ctx->temp_has_dollar_at = 0;
+  ctx->pflags = (ctx->word->flags & W_NOCOMSUB) ? PF_NOCOMSUB : 0;
+  if (ctx->word->flags & W_NOSPLIT2)
+    ctx->pflags |= PF_NOSPLIT2;
+  if (ctx->word->flags & W_ASSIGNRHS)
+    ctx->pflags |= PF_ASSIGNRHS;
+  if (ctx->word->flags & W_COMPLETE)
+    ctx->pflags |= PF_COMPLETE;
+
+  ctx->tword = param_expand (ctx->string, &ctx->sindex, ctx->quoted,
+			     ctx->expanded_something,
+			     &ctx->temp_has_dollar_at,
+			     &ctx->quoted_dollar_at,
+			     &ctx->had_quoted_null, ctx->pflags);
+  ctx->has_dollar_at += ctx->temp_has_dollar_at;
+  ctx->split_on_spaces += (ctx->tword->flags & W_SPLITSPACE);
+
+  if (ctx->tword == &expand_wdesc_error || ctx->tword == &expand_wdesc_fatal)
+    {
+      free (ctx->string);
+      free (ctx->istring);
+      ctx->list = ((ctx->tword == &expand_wdesc_error) ? &expand_word_error
+						        : &expand_word_fatal);
+      return EWI_RETURN;
+    }
+  if (ctx->contains_dollar_at && ctx->has_dollar_at)
+    *ctx->contains_dollar_at = 1;
+
+  if (ctx->tword && (ctx->tword->flags & W_HASQUOTEDNULL))
+    ctx->had_quoted_null = 1;		/* note for later */
+  if (ctx->tword && (ctx->tword->flags & W_SAWQUOTEDNULL))
+    ctx->had_quoted_null = 1;		/* XXX */
+
+  ctx->temp = ctx->tword ? ctx->tword->word : (char *)NULL;
+  dispose_word_desc (ctx->tword);
+
+  /* Kill quoted nulls; we will add them back at the end of
+     expand_word_internal if nothing else in the string */
+  if (ctx->had_quoted_null && ctx->temp && QUOTED_NULL (ctx->temp))
+    {
+      FREE (ctx->temp);
+      ctx->temp = (char *)NULL;
+    }
+
+  return EWI_ADD_STRING;
+}
+
+/* ------------------------------------------------------------------ */
+/* ewi_handle_double_quote -- handle `case '"':` (double-quote)       */
+/* ------------------------------------------------------------------ */
+static enum ewi_action
+ewi_handle_double_quote (struct ewi_context *ctx)
+{
+  WORD_LIST *list;
+
+  /* XXX - revisit this */
+  if ((ctx->quoted & (Q_DOUBLE_QUOTES|Q_HERE_DOCUMENT)) && ((ctx->quoted & Q_ARITH) == 0))
+    return EWI_ADD_CHARACTER;
+
+  ctx->t_index = ++ctx->sindex;
+  ctx->temp = string_extract_double_quoted (ctx->string, &ctx->sindex,
+					    (ctx->word->flags & W_COMPLETE) ? SX_COMPLETE : 0);
+
+  /* If the quotes surrounded the entire string, then the
+     whole word was quoted. */
+  ctx->quoted_state = (ctx->t_index == 1 && ctx->string[ctx->sindex] == '\0')
+			  ? WHOLLY_QUOTED
+			  : PARTIALLY_QUOTED;
+
+  if (ctx->temp && *ctx->temp)
+    {
+      ctx->tword = alloc_word_desc ();
+      ctx->tword->word = ctx->temp;
+
+      if (ctx->word->flags & W_ASSIGNARG)
+	ctx->tword->flags |= ctx->word->flags & (W_ASSIGNARG|W_ASSIGNRHS); /* affects $@ */
+      if (ctx->word->flags & W_COMPLETE)
+	ctx->tword->flags |= W_COMPLETE;	/* for command substitutions */
+      if (ctx->word->flags & W_NOCOMSUB)
+	ctx->tword->flags |= W_NOCOMSUB;
+      if (ctx->word->flags & W_NOPROCSUB)
+	ctx->tword->flags |= W_NOPROCSUB;
+
+      if (ctx->word->flags & W_ASSIGNRHS)
+	ctx->tword->flags |= W_ASSIGNRHS;
+
+      ctx->temp = (char *)NULL;
+
+      ctx->temp_has_dollar_at = 0;	/* does this quoted (sub)string include $@? */
+      /* Need to get W_HASQUOTEDNULL flag through this function. */
+      /* XXX - preserve Q_ARITH here? */
+      list = expand_word_internal (ctx->tword, Q_DOUBLE_QUOTES|(ctx->quoted&Q_ARITH), 0, &ctx->temp_has_dollar_at, (int *)NULL);
+      ctx->has_dollar_at += ctx->temp_has_dollar_at;
+
+      if (list == &expand_word_error || list == &expand_word_fatal)
+	{
+	  free (ctx->istring);
+	  free (ctx->string);
+	  /* expand_word_internal has already freed temp_word->word
+	     for us because of the way it prints error messages. */
+	  ctx->tword->word = (char *)NULL;
+	  dispose_word (ctx->tword);
+	  ctx->list = list;
+	  return EWI_RETURN;
+	}
+
+      dispose_word (ctx->tword);
+
+      /* "$@" (a double-quoted dollar-at) expands into nothing,
+	 not even a NULL word, when there are no positional
+	 parameters.  Posix interp 888 says that other parts of the
+	 word that expand to quoted nulls result in quoted nulls, so
+	 we can't just throw the entire word away if we have "$@"
+	 anywhere in it.  We use had_quoted_null to keep track */
+      if (list == 0 && ctx->temp_has_dollar_at)	/* XXX - was has_dollar_at */
+	{
+	  ctx->quoted_dollar_at++;
+	  return EWI_BREAK;
+	}
+
+      /* If this list comes back with a quoted null from expansion,
+	 we have either "$x" or "$@" with $1 == ''. In either case,
+	 we need to make sure we add a quoted null argument and
+	 disable the special handling that "$@" gets. */
+      if (list && list->word && list->next == 0 && (list->word->flags & W_HASQUOTEDNULL))
+	{
+	  if (ctx->had_quoted_null && ctx->temp_has_dollar_at)
+	    ctx->quoted_dollar_at++;
+	  ctx->had_quoted_null = 1;		/* XXX */
+	}
+
+      /* If we get "$@", we know we have expanded something, so we
+	 need to remember it for the final split on $IFS.  This is
+	 a special case; it's the only case where a quoted string
+	 can expand into more than one word.  It's going to come back
+	 from the above call to expand_word_internal as a list with
+	 multiple words. */
+      if (list)
+	dequote_list (list);
+
+      if (ctx->temp_has_dollar_at)		/* XXX - was has_dollar_at */
+	{
+	  ctx->quoted_dollar_at++;
+	  if (ctx->contains_dollar_at)
+	    *ctx->contains_dollar_at = 1;
+	  if (ctx->expanded_something)
+	    *ctx->expanded_something = 1;
+	  ctx->local_expanded = 1;
+	}
+    }
+  else
+    {
+      /* What we have is "".  This is a minor optimization. */
+      FREE (ctx->temp);
+      list = (WORD_LIST *)NULL;
+      ctx->had_quoted_null = 1;	/* note for later */
+    }
+
+  /* The code above *might* return a list (consider the case of "$@",
+     where it returns "$1", "$2", etc.).  We can't throw away the
+     rest of the list, and we have to make sure each word gets added
+     as quoted.  We test on tresult->next:  if it is non-NULL, we
+     quote the whole list, save it to a string with string_list, and
+     add that string. We don't need to quote the results of this
+     (and it would be wrong, since that would quote the separators
+     as well), so we go directly to add_string. */
+  if (list)
+    {
+      if (list->next)
+	{
+	  /* Testing quoted_dollar_at makes sure that "$@" is
+	     split correctly when $IFS does not contain a space. */
+	  ctx->temp = ctx->quoted_dollar_at
+			      ? string_list_dollar_at (list, Q_DOUBLE_QUOTES, 0)
+			      : string_list (quote_list (list));
+	  dispose_words (list);
+	  return EWI_ADD_STRING;
+	}
+      else
+	{
+	  ctx->temp = savestring (list->word->word);
+	  ctx->tflag = list->word->flags;
+	  dispose_words (list);
+
+	  /* If the string is not a quoted null string, we want
+	     to remove any embedded unquoted CTLNUL characters.
+	     We do not want to turn quoted null strings back into
+	     the empty string, though.  We do this because we
+	     want to remove any quoted nulls from expansions that
+	     contain other characters.  For example, if we have
+	     x"$*"y or "x$*y" and there are no positional parameters,
+	     the $* should expand into nothing. */
+	  /* We use the W_HASQUOTEDNULL flag to differentiate the
+	     cases:  a quoted null character as above and when
+	     CTLNUL is contained in the (non-null) expansion
+	     of some variable.  We use the had_quoted_null flag to
+	     pass the value through this function to its caller. */
+	  if ((ctx->tflag & W_HASQUOTEDNULL) && QUOTED_NULL (ctx->temp) == 0)
+	    remove_quoted_nulls (ctx->temp);	/* XXX */
+	}
+    }
+  else
+    ctx->temp = (char *)NULL;
+
+  if (ctx->temp == 0 && ctx->quoted_state == PARTIALLY_QUOTED)
+    ctx->had_quoted_null = 1;	/* note for later */
+
+  /* We do not want to add quoted nulls to strings that are only
+     partially quoted; we can throw them away.  The exception to
+     this is when we are going to be performing word splitting,
+     since we have to preserve a null argument if the next character
+     will cause word splitting. */
+  if (ctx->temp == 0 && ctx->quoted_state == PARTIALLY_QUOTED && ctx->quoted == 0 && (ctx->word->flags & (W_NOSPLIT|W_EXPANDRHS|W_ASSIGNRHS)) == W_EXPANDRHS)
+    {
+      ctx->c = CTLNUL;
+      ctx->sindex--;
+      ctx->had_quoted_null = 1;
+      return EWI_ADD_CHARACTER;
+    }
+  if (ctx->temp == 0 && ctx->quoted_state == PARTIALLY_QUOTED && (ctx->word->flags & (W_NOSPLIT|W_NOSPLIT2)))
+    return EWI_CONTINUE;
+
+  /* Fall through to add_quoted_string logic. */
+  return EWI_ADD_QUOTED_STRING;
+}
+
+/* ------------------------------------------------------------------ */
+/* ewi_assemble_result -- post-loop result assembly                   */
+/*   (the `finished_with_string:` label block)                        */
+/* ------------------------------------------------------------------ */
+static WORD_LIST *
+ewi_assemble_result (struct ewi_context *ctx)
+{
+  WORD_LIST *list;
+  WORD_DESC *tword;
+
+  list = (WORD_LIST *)NULL;
+
+  if (*ctx->istring == '\0')
+    {
+#if 0
+      if (ctx->quoted_dollar_at == 0 && (ctx->had_quoted_null || ctx->quoted_state == PARTIALLY_QUOTED))
+#else
+      if (ctx->had_quoted_null || (ctx->quoted_dollar_at == 0 && ctx->quoted_state == PARTIALLY_QUOTED))
+#endif
+	{
+	  ctx->istring[0] = CTLNUL;
+	  ctx->istring[1] = '\0';
+	  tword = alloc_word_desc ();
+	  tword->word = ctx->istring;
+	  ctx->istring = 0;		/* avoid later free() */
+	  tword->flags |= W_HASQUOTEDNULL;		/* XXX */
+	  list = make_word_list (tword, (WORD_LIST *)NULL);
+	  if (ctx->quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
+	    tword->flags |= W_QUOTED;
+	}
+      /* According to sh, ksh, and Posix.2, if a word expands into nothing
+	 and a double-quoted "$@" appears anywhere in it, then the entire
+	 word is removed. */
+      /* XXX - exception appears to be that quoted null strings result in
+	 null arguments */
+      else  if (ctx->quoted_state == UNQUOTED || ctx->quoted_dollar_at)
+	list = (WORD_LIST *)NULL;
+      else
+	list = (WORD_LIST *)NULL;
+    }
+  else if (ctx->word->flags & W_NOSPLIT)
+    {
+      tword = alloc_word_desc ();
+      tword->word = ctx->istring;
+      if (ctx->had_quoted_null && QUOTED_NULL (ctx->istring))
+	tword->flags |= W_HASQUOTEDNULL;
+      ctx->istring = 0;		/* avoid later free() */
+      if (ctx->word->flags & W_ASSIGNMENT)
+	tword->flags |= W_ASSIGNMENT;	/* XXX */
+      if (ctx->word->flags & W_COMPASSIGN)
+	tword->flags |= W_COMPASSIGN;	/* XXX */
+      if (ctx->word->flags & W_NOGLOB)
+	tword->flags |= W_NOGLOB;	/* XXX */
+      if (ctx->word->flags & W_NOBRACE)
+	tword->flags |= W_NOBRACE;	/* XXX */
+      if (ctx->word->flags & W_ARRAYREF)
+	tword->flags |= W_ARRAYREF;
+      if (ctx->quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
+	tword->flags |= W_QUOTED;
+      list = make_word_list (tword, (WORD_LIST *)NULL);
+    }
+  else if (ctx->word->flags & W_ASSIGNRHS)
+    {
+      list = list_string (ctx->istring, "", ctx->quoted);
+      tword = list->word;
+      if (ctx->had_quoted_null && QUOTED_NULL (ctx->istring))
+	tword->flags |= W_HASQUOTEDNULL;
+      free (list);
+      free (ctx->istring);
+      ctx->istring = 0;			/* avoid later free() */
+      goto set_word_flags;
+    }
+  else
+    {
+      char *ifs_chars;
+
+      ifs_chars = (ctx->quoted_dollar_at || ctx->has_dollar_at) ? ifs_value : (char *)NULL;
+
+      /* If we have $@, we need to split the results no matter what.  If
+	 IFS is unset or NULL, string_list_dollar_at has separated the
+	 positional parameters with a space, so we split on space (we have
+	 set ifs_chars to " \t\n" above if ifs is unset).  If IFS is set,
+	 string_list_dollar_at has separated the positional parameters
+	 with the first character of $IFS, so we split on $IFS.  If
+	 SPLIT_ON_SPACES is set, we expanded $* (unquoted) with IFS either
+	 unset or null, and we want to make sure that we split on spaces
+	 regardless of what else has happened to IFS since the expansion,
+	 or we expanded "$@" with IFS null and we need to split the positional
+	 parameters into separate words. */
+      if (ctx->split_on_spaces)
+	{
+	  /* If IFS is not set, and the word is not quoted, we want to split
+	     the individual words on $' \t\n'. We rely on previous steps to
+	     quote the portions of the word that should not be split */
+	  if (ifs_is_set == 0)
+	    list = list_string (ctx->istring, " \t\n", 1);	/* XXX quoted == 1? */
+	  else
+	    list = list_string (ctx->istring, " ", 1);	/* XXX quoted == 1? */
+	}
+
+      /* If we have $@ (has_dollar_at != 0) and we are in a context where we
+	 don't want to split the result (W_NOSPLIT2), and we are not quoted,
+	 we have already separated the arguments with the first character of
+	 $IFS.  In this case, we want to return a list with a single word
+	 with the separator possibly replaced with a space (it's what other
+	 shells seem to do).
+	 quoted_dollar_at is internal to this function and is set if we are
+	 passed an argument that is unquoted (quoted == 0) but we encounter a
+	 double-quoted $@ while expanding it. */
+      else if (ctx->has_dollar_at && ctx->quoted_dollar_at == 0 && ifs_chars && ctx->quoted == 0 && (ctx->word->flags & W_NOSPLIT2))
+	{
+	  tword = alloc_word_desc ();
+	  /* Only split and rejoin if we have to */
+	  if (*ifs_chars && *ifs_chars != ' ')
+	    {
+	      /* list_string dequotes CTLESCs in the string it's passed, so we
+		 need it to get the space separation right if space isn't the
+		 first character in IFS (but is present) and to remove the
+		 quoting we added back in param_expand(). */
+	      list = list_string (ctx->istring, *ifs_chars ? ifs_chars : " ", 1);
+	      /* This isn't exactly right in the case where we're expanding
+		 the RHS of an expansion like ${var-$@} where IFS=: (for
+		 example). The W_NOSPLIT2 means we do the separation with :;
+		 the list_string removes the quotes and breaks the string into
+		 a list, and the string_list rejoins it on spaces. When we
+		 return, we expect to be able to split the results, but the
+		 space separation means the right split doesn't happen. */
+	      tword->word = string_list (list);
+	    }
+	  else
+	    tword->word = ctx->istring;
+	  if (ctx->had_quoted_null && QUOTED_NULL (ctx->istring))
+	    tword->flags |= W_HASQUOTEDNULL;	/* XXX */
+	  if (tword->word != ctx->istring)
+	    free (ctx->istring);
+	  ctx->istring = 0;			/* avoid later free() */
+	  goto set_word_flags;
+	}
+      else if (ctx->has_dollar_at && ifs_chars)
+	list = list_string (ctx->istring, *ifs_chars ? ifs_chars : " ", 1);
+      else
+	{
+	  tword = alloc_word_desc ();
+	  if (ctx->expanded_something && *ctx->expanded_something == 0 && ctx->has_quoted_ifs)
+	    tword->word = remove_quoted_ifs (ctx->istring);
+	  else
+	    tword->word = ctx->istring;
+	  if (ctx->had_quoted_null && QUOTED_NULL (ctx->istring))	/* should check for more than one */
+	    tword->flags |= W_HASQUOTEDNULL;	/* XXX */
+	  else if (ctx->had_quoted_null)
+	    tword->flags |= W_SAWQUOTEDNULL;	/* XXX */
+	  if (tword->word != ctx->istring)
+	    free (ctx->istring);
+	  ctx->istring = 0;			/* avoid later free() */
+set_word_flags:
+	  if ((ctx->quoted & (Q_DOUBLE_QUOTES|Q_HERE_DOCUMENT)) || (ctx->quoted_state == WHOLLY_QUOTED))
+	    tword->flags |= W_QUOTED;
+	  if (ctx->word->flags & W_ASSIGNMENT)
+	    tword->flags |= W_ASSIGNMENT;
+	  if (ctx->word->flags & W_COMPASSIGN)
+	    tword->flags |= W_COMPASSIGN;
+	  if (ctx->word->flags & W_NOGLOB)
+	    tword->flags |= W_NOGLOB;
+	  if (ctx->word->flags & W_NOBRACE)
+	    tword->flags |= W_NOBRACE;
+	  if (ctx->word->flags & W_ARRAYREF)
+	    tword->flags |= W_ARRAYREF;
+	  list = make_word_list (tword, (WORD_LIST *)NULL);
+	}
+    }
+
+  /* Do NOT free ctx->istring here; the caller is responsible for freeing
+     it after we return, using the updated ctx->istring value. */
+  return (list);
+}
+
+/* ====================================================================== */
 
 static WORD_LIST *
-expand_word_internal (word, quoted, isexp, contains_dollar_at, expanded_something)
-     WORD_DESC *word;
-     int quoted, isexp;
-     int *contains_dollar_at;
-     int *expanded_something;
+expand_word_internal (WORD_DESC *word, int quoted, int isexp, int *contains_dollar_at, int *expanded_something)
 {
   WORD_LIST *list;
   WORD_DESC *tword;
@@ -10980,6 +6338,9 @@ expand_word_internal (word, quoted, isexp, contains_dollar_at, expanded_somethin
   int t_index;			/* For calls to string_extract_xxx. */
 
   char twochars[2];
+
+  struct ewi_context ctx;
+  enum ewi_action ewi_act;
 
   DECLARE_MBSTATE;
 
@@ -11220,52 +6581,15 @@ add_string:
 	    }
 	
 	case '$':
-	  if (expanded_something)
-	    *expanded_something = 1;
-	  local_expanded = 1;
-
-	  temp_has_dollar_at = 0;
-	  pflags = (word->flags & W_NOCOMSUB) ? PF_NOCOMSUB : 0;
-	  if (word->flags & W_NOSPLIT2)
-	    pflags |= PF_NOSPLIT2;
-	  if (word->flags & W_ASSIGNRHS)
-	    pflags |= PF_ASSIGNRHS;
-	  if (word->flags & W_COMPLETE)
-	    pflags |= PF_COMPLETE;
-
-	  tword = param_expand (string, &sindex, quoted, expanded_something,
-			       &temp_has_dollar_at, &quoted_dollar_at,
-			       &had_quoted_null, pflags);
-	  has_dollar_at += temp_has_dollar_at;
-	  split_on_spaces += (tword->flags & W_SPLITSPACE);
-
-	  if (tword == &expand_wdesc_error || tword == &expand_wdesc_fatal)
-	    {
-	      free (string);
-	      free (istring);
-	      return ((tword == &expand_wdesc_error) ? &expand_word_error
-						     : &expand_word_fatal);
-	    }
-	  if (contains_dollar_at && has_dollar_at)
-	    *contains_dollar_at = 1;
-
-	  if (tword && (tword->flags & W_HASQUOTEDNULL))
-	    had_quoted_null = 1;		/* note for later */
-	  if (tword && (tword->flags & W_SAWQUOTEDNULL))
-	    had_quoted_null = 1;		/* XXX */
-
-	  temp = tword ? tword->word : (char *)NULL;
-	  dispose_word_desc (tword);
-
-	  /* Kill quoted nulls; we will add them back at the end of
-	     expand_word_internal if nothing else in the string */
-	  if (had_quoted_null && temp && QUOTED_NULL (temp))
-	    {
-	      FREE (temp);
-	      temp = (char *)NULL;
-	    }
-
-	  goto add_string;
+	  {
+	    enum ewi_action act;
+	    EWI_CTX_SAVE(ctx);
+	    act = ewi_handle_dollar (&ctx);
+	    EWI_CTX_RESTORE(ctx);
+	    if (act == EWI_RETURN)
+	      return ctx.list;
+	    goto add_string;
+	  }
 	  break;
 
 	case '`':		/* Backquoted command substitution. */
@@ -11384,170 +6708,23 @@ add_twochars:
 	  break;
 
 	case '"':
-	  /* XXX - revisit this */
-	  if ((quoted & (Q_DOUBLE_QUOTES|Q_HERE_DOCUMENT)) && ((quoted & Q_ARITH) == 0))
-	    goto add_character;
-
-	  t_index = ++sindex;
-	  temp = string_extract_double_quoted (string, &sindex, (word->flags & W_COMPLETE) ? SX_COMPLETE : 0);
-
-	  /* If the quotes surrounded the entire string, then the
-	     whole word was quoted. */
-	  quoted_state = (t_index == 1 && string[sindex] == '\0')
-			    ? WHOLLY_QUOTED
-			    : PARTIALLY_QUOTED;
-
-	  if (temp && *temp)
-	    {
-	      tword = alloc_word_desc ();
-	      tword->word = temp;
-
-	      if (word->flags & W_ASSIGNARG)
-		tword->flags |= word->flags & (W_ASSIGNARG|W_ASSIGNRHS); /* affects $@ */
-	      if (word->flags & W_COMPLETE)
-		tword->flags |= W_COMPLETE;	/* for command substitutions */
-	      if (word->flags & W_NOCOMSUB)
-		tword->flags |= W_NOCOMSUB;
-	      if (word->flags & W_NOPROCSUB)
-		tword->flags |= W_NOPROCSUB;
-
-	      if (word->flags & W_ASSIGNRHS)
-		tword->flags |= W_ASSIGNRHS;
-
-	      temp = (char *)NULL;
-
-	      temp_has_dollar_at = 0;	/* does this quoted (sub)string include $@? */
-	      /* Need to get W_HASQUOTEDNULL flag through this function. */
-	      /* XXX - preserve Q_ARITH here? */
-	      list = expand_word_internal (tword, Q_DOUBLE_QUOTES|(quoted&Q_ARITH), 0, &temp_has_dollar_at, (int *)NULL);
-	      has_dollar_at += temp_has_dollar_at;
-
-	      if (list == &expand_word_error || list == &expand_word_fatal)
-		{
-		  free (istring);
-		  free (string);
-		  /* expand_word_internal has already freed temp_word->word
-		     for us because of the way it prints error messages. */
-		  tword->word = (char *)NULL;
-		  dispose_word (tword);
-		  return list;
-		}
-
-	      dispose_word (tword);
-
-	      /* "$@" (a double-quoted dollar-at) expands into nothing,
-		 not even a NULL word, when there are no positional
-		 parameters.  Posix interp 888 says that other parts of the
-		 word that expand to quoted nulls result in quoted nulls, so
-		 we can't just throw the entire word away if we have "$@"
-		 anywhere in it.  We use had_quoted_null to keep track */
-	      if (list == 0 && temp_has_dollar_at)	/* XXX - was has_dollar_at */
-		{
-		  quoted_dollar_at++;
-		  break;
-		}
-
-	      /* If this list comes back with a quoted null from expansion,
-		 we have either "$x" or "$@" with $1 == ''. In either case,
-		 we need to make sure we add a quoted null argument and
-		 disable the special handling that "$@" gets. */
-	      if (list && list->word && list->next == 0 && (list->word->flags & W_HASQUOTEDNULL))
-		{
-		  if (had_quoted_null && temp_has_dollar_at)
-		    quoted_dollar_at++;
-		  had_quoted_null = 1;		/* XXX */
-		}
-
-	      /* If we get "$@", we know we have expanded something, so we
-		 need to remember it for the final split on $IFS.  This is
-		 a special case; it's the only case where a quoted string
-		 can expand into more than one word.  It's going to come back
-		 from the above call to expand_word_internal as a list with
-		 multiple words. */
-	      if (list)
-		dequote_list (list);
-
-	      if (temp_has_dollar_at)		/* XXX - was has_dollar_at */
-		{
-		  quoted_dollar_at++;
-		  if (contains_dollar_at)
-		    *contains_dollar_at = 1;
-		  if (expanded_something)
-		    *expanded_something = 1;
-		  local_expanded = 1;
-		}
-	    }
-	  else
-	    {
-	      /* What we have is "".  This is a minor optimization. */
-	      FREE (temp);
-	      list = (WORD_LIST *)NULL;
-	      had_quoted_null = 1;	/* note for later */
-	    }
-
-	  /* The code above *might* return a list (consider the case of "$@",
-	     where it returns "$1", "$2", etc.).  We can't throw away the
-	     rest of the list, and we have to make sure each word gets added
-	     as quoted.  We test on tresult->next:  if it is non-NULL, we
-	     quote the whole list, save it to a string with string_list, and
-	     add that string. We don't need to quote the results of this
-	     (and it would be wrong, since that would quote the separators
-	     as well), so we go directly to add_string. */
-	  if (list)
-	    {
-	      if (list->next)
-		{
-		  /* Testing quoted_dollar_at makes sure that "$@" is
-		     split correctly when $IFS does not contain a space. */
-		  temp = quoted_dollar_at
-				? string_list_dollar_at (list, Q_DOUBLE_QUOTES, 0)
-				: string_list (quote_list (list));
-		  dispose_words (list);
-		  goto add_string;
-		}
-	      else
-		{
-		  temp = savestring (list->word->word);
-		  tflag = list->word->flags;
-		  dispose_words (list);
-
-		  /* If the string is not a quoted null string, we want
-		     to remove any embedded unquoted CTLNUL characters.
-		     We do not want to turn quoted null strings back into
-		     the empty string, though.  We do this because we
-		     want to remove any quoted nulls from expansions that
-		     contain other characters.  For example, if we have
-		     x"$*"y or "x$*y" and there are no positional parameters,
-		     the $* should expand into nothing. */
-		  /* We use the W_HASQUOTEDNULL flag to differentiate the
-		     cases:  a quoted null character as above and when
-		     CTLNUL is contained in the (non-null) expansion
-		     of some variable.  We use the had_quoted_null flag to
-		     pass the value through this function to its caller. */
-		  if ((tflag & W_HASQUOTEDNULL) && QUOTED_NULL (temp) == 0)
-		    remove_quoted_nulls (temp);	/* XXX */
-		}
-	    }
-	  else
-	    temp = (char *)NULL;
-
-	  if (temp == 0 && quoted_state == PARTIALLY_QUOTED)
-	    had_quoted_null = 1;	/* note for later */
-
-	  /* We do not want to add quoted nulls to strings that are only
-	     partially quoted; we can throw them away.  The exception to
-	     this is when we are going to be performing word splitting,
-	     since we have to preserve a null argument if the next character
-	     will cause word splitting. */
-	  if (temp == 0 && quoted_state == PARTIALLY_QUOTED && quoted == 0 && (word->flags & (W_NOSPLIT|W_EXPANDRHS|W_ASSIGNRHS)) == W_EXPANDRHS)
-	    {
-	      c = CTLNUL;
-	      sindex--;
-	      had_quoted_null = 1;
-	      goto add_character;
-	    }
-	  if (temp == 0 && quoted_state == PARTIALLY_QUOTED && (word->flags & (W_NOSPLIT|W_NOSPLIT2)))
-	    continue;
+	  {
+	    enum ewi_action act;
+	    EWI_CTX_SAVE(ctx);
+	    act = ewi_handle_double_quote (&ctx);
+	    EWI_CTX_RESTORE(ctx);
+	    switch (act)
+	      {
+	      case EWI_ADD_CHARACTER:	goto add_character;
+	      case EWI_RETURN:		return ctx.list;
+	      case EWI_BREAK:		break;
+	      case EWI_ADD_STRING:	goto add_string;
+	      case EWI_CONTINUE:	continue;
+	      case EWI_ADD_QUOTED_STRING:
+	      default:			goto add_quoted_string;
+	      }
+	    break;
+	  }
 
 	add_quoted_string:
 
@@ -11687,191 +6864,12 @@ add_character:
     }
 
 finished_with_string:
-  /* OK, we're ready to return.  If we have a quoted string, and
-     quoted_dollar_at is not set, we do no splitting at all; otherwise
-     we split on ' '.  The routines that call this will handle what to
-     do if nothing has been expanded. */
-
-  /* Partially and wholly quoted strings which expand to the empty
-     string are retained as an empty arguments.  Unquoted strings
-     which expand to the empty string are discarded.  The single
-     exception is the case of expanding "$@" when there are no
-     positional parameters.  In that case, we discard the expansion. */
-
-  /* Because of how the code that handles "" and '' in partially
-     quoted strings works, we need to make ISTRING into a QUOTED_NULL
-     if we saw quoting characters, but the expansion was empty.
-     "" and '' are tossed away before we get to this point when
-     processing partially quoted strings.  This makes "" and $xxx""
-     equivalent when xxx is unset.  We also look to see whether we
-     saw a quoted null from a ${} expansion and add one back if we
-     need to. */
-
-  /* If we expand to nothing and there were no single or double quotes
-     in the word, we throw it away.  Otherwise, we return a NULL word.
-     The single exception is for $@ surrounded by double quotes when
-     there are no positional parameters.  In that case, we also throw
-     the word away. */
-
-  if (*istring == '\0')
-    {
-#if 0
-      if (quoted_dollar_at == 0 && (had_quoted_null || quoted_state == PARTIALLY_QUOTED))
-#else
-      if (had_quoted_null || (quoted_dollar_at == 0 && quoted_state == PARTIALLY_QUOTED))
-#endif
-	{
-	  istring[0] = CTLNUL;
-	  istring[1] = '\0';
-	  tword = alloc_word_desc ();
-	  tword->word = istring;
-	  istring = 0;		/* avoid later free() */
-	  tword->flags |= W_HASQUOTEDNULL;		/* XXX */
-	  list = make_word_list (tword, (WORD_LIST *)NULL);
-	  if (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
-	    tword->flags |= W_QUOTED;
-	}
-      /* According to sh, ksh, and Posix.2, if a word expands into nothing
-	 and a double-quoted "$@" appears anywhere in it, then the entire
-	 word is removed. */
-      /* XXX - exception appears to be that quoted null strings result in
-	 null arguments */
-      else  if (quoted_state == UNQUOTED || quoted_dollar_at)
-	list = (WORD_LIST *)NULL;
-      else
-	list = (WORD_LIST *)NULL;
-    }
-  else if (word->flags & W_NOSPLIT)
-    {
-      tword = alloc_word_desc ();
-      tword->word = istring;
-      if (had_quoted_null && QUOTED_NULL (istring))
-	tword->flags |= W_HASQUOTEDNULL;
-      istring = 0;		/* avoid later free() */
-      if (word->flags & W_ASSIGNMENT)
-	tword->flags |= W_ASSIGNMENT;	/* XXX */
-      if (word->flags & W_COMPASSIGN)
-	tword->flags |= W_COMPASSIGN;	/* XXX */
-      if (word->flags & W_NOGLOB)
-	tword->flags |= W_NOGLOB;	/* XXX */
-      if (word->flags & W_NOBRACE)
-	tword->flags |= W_NOBRACE;	/* XXX */
-      if (word->flags & W_ARRAYREF)
-	tword->flags |= W_ARRAYREF;
-      if (quoted & (Q_HERE_DOCUMENT|Q_DOUBLE_QUOTES))
-	tword->flags |= W_QUOTED;
-      list = make_word_list (tword, (WORD_LIST *)NULL);
-    }
-  else if (word->flags & W_ASSIGNRHS)
-    {
-      list = list_string (istring, "", quoted);
-      tword = list->word;
-      if (had_quoted_null && QUOTED_NULL (istring))
-	tword->flags |= W_HASQUOTEDNULL;
-      free (list);
-      free (istring);
-      istring = 0;			/* avoid later free() */
-      goto set_word_flags;
-    }
-  else
-    {
-      char *ifs_chars;
-
-      ifs_chars = (quoted_dollar_at || has_dollar_at) ? ifs_value : (char *)NULL;
-
-      /* If we have $@, we need to split the results no matter what.  If
-	 IFS is unset or NULL, string_list_dollar_at has separated the
-	 positional parameters with a space, so we split on space (we have
-	 set ifs_chars to " \t\n" above if ifs is unset).  If IFS is set,
-	 string_list_dollar_at has separated the positional parameters
-	 with the first character of $IFS, so we split on $IFS.  If
-	 SPLIT_ON_SPACES is set, we expanded $* (unquoted) with IFS either
-	 unset or null, and we want to make sure that we split on spaces
-	 regardless of what else has happened to IFS since the expansion,
-	 or we expanded "$@" with IFS null and we need to split the positional
-	 parameters into separate words. */
-      if (split_on_spaces)
-	{
-	  /* If IFS is not set, and the word is not quoted, we want to split
-	     the individual words on $' \t\n'. We rely on previous steps to
-	     quote the portions of the word that should not be split */
-	  if (ifs_is_set == 0)
-	    list = list_string (istring, " \t\n", 1);	/* XXX quoted == 1? */
-	  else
-	    list = list_string (istring, " ", 1);	/* XXX quoted == 1? */
-	}
-
-      /* If we have $@ (has_dollar_at != 0) and we are in a context where we
-	 don't want to split the result (W_NOSPLIT2), and we are not quoted,
-	 we have already separated the arguments with the first character of
-	 $IFS.  In this case, we want to return a list with a single word
-	 with the separator possibly replaced with a space (it's what other
-	 shells seem to do).
-	 quoted_dollar_at is internal to this function and is set if we are
-	 passed an argument that is unquoted (quoted == 0) but we encounter a
-	 double-quoted $@ while expanding it. */
-      else if (has_dollar_at && quoted_dollar_at == 0 && ifs_chars && quoted == 0 && (word->flags & W_NOSPLIT2))
-	{
-	  tword = alloc_word_desc ();
-	  /* Only split and rejoin if we have to */
-	  if (*ifs_chars && *ifs_chars != ' ')
-	    {
-	      /* list_string dequotes CTLESCs in the string it's passed, so we
-		 need it to get the space separation right if space isn't the
-		 first character in IFS (but is present) and to remove the 
-		 quoting we added back in param_expand(). */
-	      list = list_string (istring, *ifs_chars ? ifs_chars : " ", 1);
-	      /* This isn't exactly right in the case where we're expanding
-		 the RHS of an expansion like ${var-$@} where IFS=: (for
-		 example). The W_NOSPLIT2 means we do the separation with :;
-		 the list_string removes the quotes and breaks the string into
-		 a list, and the string_list rejoins it on spaces. When we
-		 return, we expect to be able to split the results, but the
-		 space separation means the right split doesn't happen. */
-	      tword->word = string_list (list);	
-	    }
-	  else
-	    tword->word = istring;
-	  if (had_quoted_null && QUOTED_NULL (istring))
-	    tword->flags |= W_HASQUOTEDNULL;	/* XXX */
-	  if (tword->word != istring)
-	    free (istring);
-	  istring = 0;			/* avoid later free() */
-	  goto set_word_flags;
-	}
-      else if (has_dollar_at && ifs_chars)
-	list = list_string (istring, *ifs_chars ? ifs_chars : " ", 1);
-      else
-	{
-	  tword = alloc_word_desc ();
-	  if (expanded_something && *expanded_something == 0 && has_quoted_ifs)
-	    tword->word = remove_quoted_ifs (istring);
-	  else
-	    tword->word = istring;
-	  if (had_quoted_null && QUOTED_NULL (istring))	/* should check for more than one */
-	    tword->flags |= W_HASQUOTEDNULL;	/* XXX */
-	  else if (had_quoted_null)
-	    tword->flags |= W_SAWQUOTEDNULL;	/* XXX */
-	  if (tword->word != istring)
-	    free (istring);
-	  istring = 0;			/* avoid later free() */
-set_word_flags:
-	  if ((quoted & (Q_DOUBLE_QUOTES|Q_HERE_DOCUMENT)) || (quoted_state == WHOLLY_QUOTED))
-	    tword->flags |= W_QUOTED;
-	  if (word->flags & W_ASSIGNMENT)
-	    tword->flags |= W_ASSIGNMENT;
-	  if (word->flags & W_COMPASSIGN)
-	    tword->flags |= W_COMPASSIGN;
-	  if (word->flags & W_NOGLOB)
-	    tword->flags |= W_NOGLOB;
-	  if (word->flags & W_NOBRACE)
-	    tword->flags |= W_NOBRACE;
-	  if (word->flags & W_ARRAYREF)
-	    tword->flags |= W_ARRAYREF;
-	  list = make_word_list (tword, (WORD_LIST *)NULL);
-	}
-    }
-
+  /* Assemble the final result from the expanded istring.  Handles quoting
+     state, $@ splitting, word flags, and IFS-based splitting. */
+  EWI_CTX_SAVE(ctx);
+  list = ewi_assemble_result (&ctx);
+  /* ewi_assemble_result may have set istring to 0 to prevent double-free */
+  istring = ctx.istring;
   free (istring);
   return (list);
 }
@@ -11885,9 +6883,7 @@ set_word_flags:
 /* Perform quote removal on STRING.  If QUOTED > 0, assume we are obeying the
    backslash quoting rules for within double quotes or a here document. */
 char *
-string_quote_removal (string, quoted)
-     char *string;
-     int quoted;
+string_quote_removal (char *string, int quoted)
 {
   size_t slen;
   char *r, *result_string, *temp, *send;
@@ -11953,9 +6949,7 @@ string_quote_removal (string, quoted)
 /* Perform quote removal on word WORD.  This allocates and returns a new
    WORD_DESC *. */
 WORD_DESC *
-word_quote_removal (word, quoted)
-     WORD_DESC *word;
-     int quoted;
+word_quote_removal (WORD_DESC *word, int quoted)
 {
   WORD_DESC *w;
   char *t;
@@ -11970,9 +6964,7 @@ word_quote_removal (word, quoted)
    the members of the list are treated as if they are surrounded by
    double quotes.  Return a new list, or NULL if LIST is NULL. */
 WORD_LIST *
-word_list_quote_removal (list, quoted)
-     WORD_LIST *list;
-     int quoted;
+word_list_quote_removal (WORD_LIST *list, int quoted)
 {
   WORD_LIST *result, *t, *tresult, *e;
 
@@ -12003,8 +6995,7 @@ word_list_quote_removal (list, quoted)
  *******************************************/
 
 void
-setifs (v)
-     SHELL_VAR *v;
+setifs (SHELL_VAR *v)
 {
   char *t;
   unsigned char uc;
@@ -12064,9 +7055,7 @@ getifs ()
    is not quoted.  list_string () performs quote removal for us, even if we
    don't do any splitting. */
 WORD_LIST *
-word_split (w, ifs_chars)
-     WORD_DESC *w;
-     char *ifs_chars;
+word_split (WORD_DESC *w, char *ifs_chars)
 {
   WORD_LIST *result;
 
@@ -12086,8 +7075,7 @@ word_split (w, ifs_chars)
 /* Perform word splitting on LIST and return the RESULT.  It is possible
    to return (WORD_LIST *)NULL. */
 static WORD_LIST *
-word_list_split (list)
-     WORD_LIST *list;
+word_list_split (WORD_LIST *list)
 {
   WORD_LIST *result, *t, *tresult, *e;
   WORD_DESC *w;
@@ -12133,9 +7121,8 @@ word_list_split (list)
  **************************************************/
 
 /* Do any word-expansion-specific cleanup and jump to top_level */
-static void
-exp_jump_to_top_level (v)
-     int v;
+void
+exp_jump_to_top_level (int v)
 {
   set_pipestatus_from_exit (last_command_exit_value);
 
@@ -12162,8 +7149,7 @@ exp_jump_to_top_level (v)
    variable assignments and other environment assignments are placed
    on SUBST_ASSIGN_VARLIST. */
 static WORD_LIST *
-separate_out_assignments (tlist)
-     WORD_LIST *tlist;
+separate_out_assignments (WORD_LIST *tlist)
 {
   register WORD_LIST *vp, *lp;
 
@@ -12274,8 +7260,7 @@ separate_out_assignments (tlist)
    variable assignments. */
 
 WORD_LIST *
-expand_words (list)
-     WORD_LIST *list;
+expand_words (WORD_LIST *list)
 {
   return (expand_word_list_internal (list, WEXP_ALL));
 }
@@ -12283,23 +7268,19 @@ expand_words (list)
 /* Same as expand_words (), but doesn't hack variable or environment
    variables. */
 WORD_LIST *
-expand_words_no_vars (list)
-     WORD_LIST *list;
+expand_words_no_vars (WORD_LIST *list)
 {
   return (expand_word_list_internal (list, WEXP_NOVARS));
 }
 
 WORD_LIST *
-expand_words_shellexp (list)
-     WORD_LIST *list;
+expand_words_shellexp (WORD_LIST *list)
 {
   return (expand_word_list_internal (list, WEXP_SHELLEXP));
 }
 
 static WORD_LIST *
-glob_expand_word_list (tlist, eflags)
-     WORD_LIST *tlist;
-     int eflags;
+glob_expand_word_list (WORD_LIST *tlist, int eflags)
 {
   char **glob_array, *temp_string;
   register int glob_index;
@@ -12406,9 +7387,7 @@ glob_expand_word_list (tlist, eflags)
 
 #if defined (BRACE_EXPANSION)
 static WORD_LIST *
-brace_expand_word_list (tlist, eflags)
-     WORD_LIST *tlist;
-     int eflags;
+brace_expand_word_list (WORD_LIST *tlist, int eflags)
 {
   register char **expansions;
   char *temp_string;
@@ -12486,10 +7465,7 @@ brace_expand_word_list (tlist, eflags)
    the list of options to supply to `declare'. CMD is the declaration command
    we are expanding right now; it's unused currently. */
 static int
-make_internal_declare (word, option, cmd)
-     char *word;
-     char *option;
-     char *cmd;
+make_internal_declare (char *word, char *option, char *cmd)
 {
   int t, r;
   WORD_LIST *wl;
@@ -12531,9 +7507,7 @@ make_internal_declare (word, option, cmd)
    ['expanded-ind']='expanded-value'. */
 
 static WORD_LIST *
-expand_oneword (value, flags)
-     char *value;
-     int flags;
+expand_oneword (char *value, int flags)
 {
   WORD_LIST *l, *nl;
   char *t;
@@ -12586,9 +7560,7 @@ expand_oneword (value, flags)
    handling, see expand_oneword() above. The return value is
    NAME[+]=( expanded-and-quoted-VALUE ). */
 static void
-expand_compound_assignment_word (tlist, flags)
-     WORD_LIST *tlist;
-     int flags;
+expand_compound_assignment_word (WORD_LIST *tlist, int flags)
 {
   WORD_LIST *l;
   int wlen, oind, t;
@@ -12646,8 +7618,7 @@ expand_compound_assignment_word (tlist, flags)
    etc.) even though the word is single-quoted so all that needs to happen is
    quote removal. */
 static WORD_LIST *
-expand_declaration_argument (tlist, wcmd)
-     WORD_LIST *tlist, *wcmd;
+expand_declaration_argument (WORD_LIST *tlist, WORD_LIST *wcmd)
 {
   char opts[16], omap[128];
   int t, opti, oind, skip, inheriting;
@@ -12784,9 +7755,7 @@ expand_declaration_argument (tlist, wcmd)
 #endif /* ARRAY_VARS */
 
 static WORD_LIST *
-shell_expand_word_list (tlist, eflags)
-     WORD_LIST *tlist;
-     int eflags;
+shell_expand_word_list (WORD_LIST *tlist, int eflags)
 {
   WORD_LIST *expanded, *orig_list, *new_list, *next, *temp_list, *wcmd;
   int expanded_something, has_dollar_at;
@@ -12867,10 +7836,7 @@ shell_expand_word_list (tlist, eflags)
    If COMMAND == NULL, is_nullcmd usually == 1. Follow the POSIX rules for
    variable assignment errors. */
 static int
-do_assignment_statements (varlist, command, is_nullcmd)
-     WORD_LIST *varlist;
-     char *command;
-     int is_nullcmd;
+do_assignment_statements (WORD_LIST *varlist, char *command, int is_nullcmd)
 {
   WORD_LIST *temp_list;
   char *savecmd;
@@ -12958,9 +7924,7 @@ do_assignment_statements (varlist, command, is_nullcmd)
    with W_NOBRACE set do not undergo brace expansion (see
    brace_expand_word_list above). */
 static WORD_LIST *
-expand_word_list_internal (list, eflags)
-     WORD_LIST *list;
-     int eflags;
+expand_word_list_internal (WORD_LIST *list, int eflags)
 {
   WORD_LIST *new_list, *temp_list;
 

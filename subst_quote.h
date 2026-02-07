@@ -1,0 +1,34 @@
+/* subst_quote.h -- declarations for quoting functions extracted from subst.c */
+
+/* Copyright (C) 1987-2022 Free Software Foundation, Inc.
+
+   This file is part of GNU Bash, the Bourne Again SHell.
+
+   Bash is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   Bash is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with Bash.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#ifndef _SUBST_QUOTE_H_
+#define _SUBST_QUOTE_H_
+
+#include "stdc.h"
+#include "command.h"
+
+/* Functions that were static in subst.c but are now needed cross-file */
+extern WORD_LIST *list_quote_escapes PARAMS((WORD_LIST *));
+extern char *make_quoted_char PARAMS((int));
+extern WORD_LIST *quote_list PARAMS((WORD_LIST *));
+extern char *quote_rhs PARAMS((const char *));
+extern char *remove_quoted_ifs PARAMS((char *));
+
+#endif /* _SUBST_QUOTE_H_ */

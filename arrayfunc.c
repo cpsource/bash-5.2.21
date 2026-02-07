@@ -32,6 +32,7 @@
 #include "shell.h"
 #include "execute_cmd.h"
 #include "pathexp.h"
+#include "subst.h"
 
 #include "shmbutil.h"
 #if defined (HAVE_MBSTR_H) && defined (HAVE_MBSCHR)

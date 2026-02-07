@@ -329,18 +329,53 @@ extern int unclosed_pair PARAMS((char *, int, char *));
 extern WORD_LIST *split_at_delims PARAMS((char *, int, const char *, int, int, int *, int *));
 #endif
 
-/* Variables used to keep track of the characters in IFS. */
-extern SHELL_VAR *ifs_var;
-extern char *ifs_value;
-extern unsigned char ifs_cmap[];
-extern int ifs_is_set, ifs_is_null;
-
+/* Grouped IFS state. */
+typedef struct ifs_state {
+  SHELL_VAR *ifs_var;
+  char      *ifs_value;
+  unsigned char ifs_cmap[UCHAR_MAX + 1];
+  int        ifs_is_set;
+  int        ifs_is_null;
 #if defined (HANDLE_MULTIBYTE)
-extern unsigned char ifs_firstc[];
-extern size_t ifs_firstc_len;
+  unsigned char ifs_firstc[MB_LEN_MAX];
+  size_t     ifs_firstc_len;
 #else
-extern unsigned char ifs_firstc;
+  unsigned char ifs_firstc;
 #endif
+} IFS_STATE;
+
+extern IFS_STATE global_ifs;
+
+/* Compatibility macros — existing code continues to work unchanged. */
+#define ifs_var        (global_ifs.ifs_var)
+#define ifs_value      (global_ifs.ifs_value)
+#define ifs_cmap       (global_ifs.ifs_cmap)
+#define ifs_is_set     (global_ifs.ifs_is_set)
+#define ifs_is_null    (global_ifs.ifs_is_null)
+#if defined (HANDLE_MULTIBYTE)
+#define ifs_firstc     (global_ifs.ifs_firstc)
+#define ifs_firstc_len (global_ifs.ifs_firstc_len)
+#else
+#define ifs_firstc     (global_ifs.ifs_firstc)
+#endif
+
+/* Grouped expansion control flags. */
+typedef struct expand_flags {
+  int no_longjmp_on_fatal_error;
+  int allow_null_glob_expansion;
+  int fail_glob_expansion;
+  int patsub_replacement;
+  int expand_no_split_dollar_star;
+} EXPAND_FLAGS;
+
+extern EXPAND_FLAGS global_expand_flags;
+
+/* Compatibility macros — existing code continues to work unchanged. */
+#define no_longjmp_on_fatal_error  (global_expand_flags.no_longjmp_on_fatal_error)
+#define allow_null_glob_expansion  (global_expand_flags.allow_null_glob_expansion)
+#define fail_glob_expansion        (global_expand_flags.fail_glob_expansion)
+#define patsub_replacement         (global_expand_flags.patsub_replacement)
+#define expand_no_split_dollar_star (global_expand_flags.expand_no_split_dollar_star)
 
 extern int assigning_in_environment;
 extern int expanding_redir;
